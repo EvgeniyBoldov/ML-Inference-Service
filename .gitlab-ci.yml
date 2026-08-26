@@ -1,0 +1,20 @@
+stages:
+  - deploy
+
+deploy_production:
+  stage: deploy
+  tags:
+    - production-shell
+  resource_group: ml-inference-service-production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - release.env
+        - infra/compose/inference-service.compose.yaml
+        - scripts/deploy-production.sh
+  script:
+    - test -f release.env
+    - test -f infra/compose/inference-service.compose.yaml
+    - bash scripts/deploy-production.sh
+  environment:
+    name: production
