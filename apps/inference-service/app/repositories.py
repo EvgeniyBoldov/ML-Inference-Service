@@ -23,6 +23,7 @@ class DeploymentRepository(Protocol):
     async def active_for(self, model: str) -> Deployment | None: ...
     async def list_active(self) -> list[Deployment]: ...
     async def list_recoverable(self) -> list[Deployment]: ...
+    async def list_incomplete(self) -> list[Deployment]: ...
     async def activate(self, candidate: Deployment) -> Deployment | None: ...
     async def rollback(self, model: str) -> tuple[Deployment, Deployment]: ...
 
@@ -81,6 +82,13 @@ class InMemoryDeploymentRepository:
                 if deployment.status in {DeploymentStatus.ACTIVE, DeploymentStatus.STANDBY}
             ]
 
+    async def list_incomplete(self) -> list[Deployment]:
+        async with self.lock:
+            return [
+                deployment for deployment in self._deployments.values()
+                if deployment.status in {DeploymentStatus.CREATED, DeploymentStatus.DOWNLOADING, DeploymentStatus.LOADING, DeploymentStatus.WARMING_UP, DeploymentStatus.READY}
+            ]
+
     async def activate(self, candidate: Deployment) -> Deployment | None:
         """Atomically activate candidate and retain the prior runtime as previous."""
         async with self.lock:
@@ -103,6 +111,8 @@ class InMemoryDeploymentRepository:
                 raise LookupError("No previous deployment is available")
             active = self._deployments[route.active_deployment_id]
             previous = self._deployments[route.previous_deployment_id]
+            if previous.status != DeploymentStatus.STANDBY:
+                raise LookupError("Previous deployment is no longer available")
             active.status = DeploymentStatus.STANDBY
             previous.status = DeploymentStatus.ACTIVE
             self._routes[model] = Route(model, previous.id, active.id)

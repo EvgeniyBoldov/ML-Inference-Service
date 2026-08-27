@@ -37,17 +37,18 @@ The initial FastAPI implementation is available in `app/main.py`:
   OpenAI-style error envelopes, and atomic in-memory active/previous routing.
 
 Adapters are deliberately injected at `create_app()`. `UnavailableModelSource` is
-the safe default when `MLFLOW_TRACKING_URI` is absent. With that variable set,
-the app uses `MlflowModelSource` and `MlflowPyfuncRuntimeBackend`, which resolve
-only immutable `models:/<name>/<version>` URIs and read metadata/artifacts through
-MLflow. Tests use an in-process predictor runtime to exercise the endpoint
-contract.
+the safe default when `MLFLOW_TRACKING_URI` is absent. In production, when
+`MODEL_RUNTIME_BASE_FILE` and `MODEL_ARTIFACT_CACHE_ROOT` are also configured,
+the app uses `MlflowModelSource` and `DockerFleetRuntimeBackend`. It resolves
+only immutable `models:/<name>/<version>` URIs, caches artifacts through MLflow,
+and starts a GREEN container containing the complete model fleet. Every model is
+loaded and smoke-tested before the active fleet pointer is switched. Tests use an
+in-process predictor runtime to exercise the endpoint contract.
 
 Set `INFERENCE_DATABASE_URL=postgresql+asyncpg://...` to use the durable
 `SqlAlchemyDeploymentRepository`; otherwise the local in-memory repository is
 used. The repository persists deployment, route, idempotency, and cached metadata
-records. Its `initialize()` method is a local bootstrap convenience; production
-must apply a matching Alembic migration before application startup.
+records. Production applies the Alembic migration before application startup.
 
 ## Tooling
 

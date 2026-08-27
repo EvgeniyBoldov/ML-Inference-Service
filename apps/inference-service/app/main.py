@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import os
+import logging
 from contextlib import asynccontextmanager
-from time import time
+from time import perf_counter, time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from .auth import StaticTokenAuth
+from .auth import FileTokenAuth, StaticTokenAuth
 from .domain import Deployment
 from .errors import ServiceError
 from .mlflow_source import MlflowModelSource
 from .model_source import ModelSource, UnavailableModelSource
+from .metrics import ServiceMetrics
+from .logging_config import configure_structured_logging
 from .repositories import DeploymentRepository, InMemoryDeploymentRepository
-from .runtime import MlflowPyfuncRuntimeBackend, PredictorRuntimeBackend, RuntimeBackend
+from .runtime import DockerFleetRuntimeBackend, PredictorRuntimeBackend, RuntimeBackend
 from .schemas import (
     DeploymentObject, DeploymentRequest, ErrorResponse, ModelList, ModelObject,
     PredictionOutput, ResponseObject, ResponseRequest,
@@ -29,10 +32,12 @@ def create_app(
     *,
     source: ModelSource | None = None,
     runtime: RuntimeBackend | None = None,
-    auth: StaticTokenAuth | None = None,
+    auth: StaticTokenAuth | FileTokenAuth | None = None,
     repository: DeploymentRepository | None = None,
 ) -> FastAPI:
     """Create an app with replaceable integration adapters for tests and deployment."""
+    configure_structured_logging()
+    logger = logging.getLogger("ml_inference")
     if repository is None:
         database_url = os.getenv("INFERENCE_DATABASE_URL")
         if database_url:
@@ -41,8 +46,16 @@ def create_app(
         else:
             repository = InMemoryDeploymentRepository()
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-    source = source or (MlflowModelSource(tracking_uri) if tracking_uri else UnavailableModelSource())
-    runtime = runtime or (MlflowPyfuncRuntimeBackend() if tracking_uri else PredictorRuntimeBackend())
+    artifact_cache_root = os.getenv("MODEL_ARTIFACT_CACHE_ROOT")
+    source = source or (MlflowModelSource(tracking_uri, artifact_cache_root) if tracking_uri else UnavailableModelSource())
+    runtime = runtime or (
+        DockerFleetRuntimeBackend(
+            image_manifest=os.environ["MODEL_RUNTIME_BASE_FILE"],
+            artifact_cache_root=os.environ["MODEL_ARTIFACT_CACHE_ROOT"],
+            memory_limit=os.getenv("MODEL_FLEET_MEMORY_LIMIT"),
+            cpu_limit=os.getenv("MODEL_FLEET_CPU_LIMIT"),
+        ) if tracking_uri and artifact_cache_root and os.getenv("MODEL_RUNTIME_BASE_FILE") else PredictorRuntimeBackend()
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -51,15 +64,18 @@ def create_app(
             await initialize()
         await manager.restore()
         yield
+        await manager.shutdown()
         dispose = getattr(repository, "dispose", None)
         if dispose:
             await dispose()
 
     app = FastAPI(title="ML Inference Service", version="0.1.0", lifespan=lifespan)
-    manager = DeploymentManager(repository, source, runtime)
+    metrics = ServiceMetrics()
+    manager = DeploymentManager(repository, source, runtime, metrics, previous_ttl_seconds=int(os.getenv("PREVIOUS_RUNTIME_TTL_SECONDS", "3600")))
     prediction = PredictionService(manager, runtime)
-    auth = auth or StaticTokenAuth()
+    auth = auth or (FileTokenAuth(os.environ["INFERENCE_TOKEN_FILE"]) if os.getenv("INFERENCE_TOKEN_FILE") else StaticTokenAuth())
     app.state.deployment_manager = manager
+    app.state.metrics = metrics
 
     @app.exception_handler(ServiceError)
     async def service_error_handler(_request: Request, exc: ServiceError) -> JSONResponse:
@@ -74,7 +90,13 @@ def create_app(
 
     @app.get("/health/ready")
     async def ready() -> dict[str, str]:
+        if not await manager.ready():
+            raise ServiceError("RUNTIME_UNAVAILABLE", "Persisted model fleet is not ready", status_code=503)
         return {"status": "ready"}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(_: None = Depends(auth.require("metrics.read"))) -> Response:
+        return Response(metrics.exposition(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/v1/models", response_model=ModelList, responses={401: {"model": ErrorResponse}})
     async def list_models(_: None = Depends(auth.require("inference.read"))) -> ModelList:
@@ -88,11 +110,22 @@ def create_app(
 
     @app.post("/v1/responses", response_model=ResponseObject, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
     async def response(body: ResponseRequest, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:
-        deployment, output = await prediction.predict(body.model, body.input)
-        return ResponseObject(
-            id=f"resp_{uuid4().hex}", created_at=int(time()), model=body.model,
-            model_version=deployment.version, output=[PredictionOutput(content=output)],
-        )
+        request_id = f"req_{uuid4().hex}"
+        started_at = perf_counter()
+        try:
+            deployment, output, model_latency = await prediction.predict(body.model, body.input)
+        except ServiceError as exc:
+            metrics.prediction_errors.labels(body.model, "unknown", exc.code).inc()
+            metrics.prediction_requests.labels(body.model, "unknown", "error").inc()
+            logger.info("prediction_failed", extra={"request_id": request_id, "model": body.model, "status": "error", "code": exc.code})
+            raise
+        total_latency = perf_counter() - started_at
+        metrics.prediction_requests.labels(deployment.model, deployment.version, "completed").inc()
+        metrics.prediction_latency.labels(deployment.model, deployment.version, "total").observe(total_latency)
+        metrics.prediction_latency.labels(deployment.model, deployment.version, "model").observe(model_latency)
+        metrics.prediction_latency.labels(deployment.model, deployment.version, "gateway").observe(total_latency - model_latency)
+        logger.info("prediction_completed", extra={"request_id": request_id, "model": deployment.model, "version": deployment.version, "deployment_id": deployment.id, "runtime_id": deployment.runtime_id, "status": "completed", "latency_ms": round(total_latency * 1000, 3)})
+        return ResponseObject(id=f"resp_{uuid4().hex}", created_at=int(time()), model=body.model, model_version=deployment.version, output=[PredictionOutput(content=output)])
 
     @app.post("/internal/v1/deployments", status_code=202, response_model=DeploymentObject)
     async def create_deployment(

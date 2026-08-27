@@ -24,13 +24,24 @@ MLflow-backed model metadata, isolated runtimes, and blue/green traffic switchin
 - [API contract](docs/api.md) — planned public and internal HTTP interfaces.
 - [MLflow model contract](docs/mlflow-model-contract.md) — required model
   metadata, publisher library, and Airflow deployment handshake.
+- [ML engineer guide](docs/ml-engineer-guide.md) — Jupyter logging and Airflow
+  deployment of a new MLflow model version.
+- [Observability and access](docs/observability-and-access.md) — Prometheus
+  metrics and local two-role token administration.
+- [Model runtime base](docs/model-runtime-base.md) — общий base image и
+  глобальный blue/green rollout полного набора моделей.
 - [Delivery](docs/delivery.md) — Docker release, GitLab shell-runner deployment,
   host Nginx blue/green switching, and rollback process.
+- [DevOps: основной сервис](docs/devops-service-guide.md) — подготовка VM,
+  выпуск FastAPI-образа, GitLab delivery и откат.
+- [DevOps: base runtime](docs/devops-runtime-base-guide.md) — выпуск общего
+  образа зависимостей моделей и его применение к полному fleet.
 - [Development guide](apps/inference-service/README.md) — code-package layout
   and intended implementation sequence.
 
 ## Status
 
-This repository currently contains the agreed project skeleton and architecture.
-The application implementation, infrastructure manifests, CI workflows, and
-database migrations are intentionally not yet created.
+Репозиторий содержит FastAPI service, MLflow/Airflow contracts, PostgreSQL
+persistence, Docker/GitLab delivery, base runtime subproject и операционные
+инструкции. Перед первым production rollout требуется выпуск pinned base image и
+проверка интеграции с реальными MLflow, PostgreSQL, registry и Nginx.

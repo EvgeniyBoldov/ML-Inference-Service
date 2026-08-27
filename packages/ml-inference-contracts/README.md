@@ -9,4 +9,5 @@ Shared, dependency-light integration library for the ML Inference Service.
 
 The canonical contract is documented in
 [`../../docs/mlflow-model-contract.md`](../../docs/mlflow-model-contract.md).
-
+Step-by-step Jupyter and Airflow usage is in
+[`../../docs/ml-engineer-guide.md`](../../docs/ml-engineer-guide.md).

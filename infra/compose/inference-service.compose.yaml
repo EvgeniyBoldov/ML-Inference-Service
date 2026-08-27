@@ -7,6 +7,16 @@ services:
     environment:
       RELEASE_VERSION: "${RELEASE_VERSION}"
       RELEASE_COMMIT: "${RELEASE_COMMIT}"
+      INFERENCE_TOKEN_FILE: /etc/ml-inference-service/tokens
+    # Docker socket access is root-equivalent. This container is intentionally
+    # root because it creates isolated fleet runtime containers.
+    user: "0:0"
+    volumes:
+      - /etc/ml-inference-service:/etc/ml-inference-service:ro
+      - /var/lib/ml-inference-service/model-artifacts:/var/lib/ml-inference-service/model-artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - runtime
     ports:
       - "127.0.0.1:${SLOT_PORT}:8000"
     healthcheck:
@@ -20,3 +30,8 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+
+networks:
+  runtime:
+    name: ml-inference-runtime
+    external: true

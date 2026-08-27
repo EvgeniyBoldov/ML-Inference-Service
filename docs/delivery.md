@@ -51,12 +51,36 @@ Before the first deployment, provision:
 
 - `/etc/ml-inference-service/runtime.env` with MLflow, PostgreSQL, and service
   secrets; set `INFERENCE_DATABASE_URL` and `MLFLOW_TRACKING_URI` there.
+- `/etc/ml-inference-service/tokens`, created with
+  `scripts/manage-inference-token.sh`; it is mounted read-only into the service.
+- `/etc/ml-inference-service/runtime-base.env`, copied by the runtime-base
+  GitLab job from `projects/model-runtime-base/base.env` and containing a pinned
+  `RUNTIME_BASE_IMAGE` digest.
+- `/var/lib/ml-inference-service/model-artifacts`, writable by the service and
+  shared read-only with fleet runtime containers.
 - `/etc/nginx/conf.d/ml-inference-service.conf` from
   `infra/nginx/ml-inference-service.conf`.
 - `/etc/nginx/conf.d/ml-inference-service-upstream.conf` from the included
   example, then validate/reload Nginx.
 - Docker and Compose plugin; registry access is unauthenticated by current
   infrastructure decision.
+
+The deployment job executes `alembic upgrade head` using the candidate image
+before it starts the candidate service. The database URL is read only from the
+host-owned runtime environment file.
+
+For fleet model runtime, add the following values to `runtime.env`:
+
+```dotenv
+MODEL_ARTIFACT_CACHE_ROOT=/var/lib/ml-inference-service/model-artifacts
+MODEL_RUNTIME_BASE_FILE=/etc/ml-inference-service/runtime-base.env
+MODEL_FLEET_MEMORY_LIMIT=24g
+MODEL_FLEET_CPU_LIMIT=8
+```
+
+Limits are environment-specific examples. A blue/green fleet rollout loads both
+the old and new complete model sets, so the VM must have headroom for roughly two
+loaded fleets.
 
 ## Blue/green and rollback
 

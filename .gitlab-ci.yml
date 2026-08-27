@@ -1,11 +1,36 @@
 stages:
+  - test
+  - runtime_config
   - deploy
+
+test_service:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install 'apps/inference-service[test,postgres]'
+    - cd apps/inference-service && pytest -q
+    - cd ../../packages/ml-inference-contracts && pip install '.[mlflow]' && pytest -q
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+deploy_runtime_base_config:
+  stage: runtime_config
+  tags:
+    - production-shell
+  resource_group: ml-inference-service-production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - projects/model-runtime-base/**
+  script:
+    - bash scripts/deploy-runtime-base-config.sh
 
 deploy_production:
   stage: deploy
   tags:
     - production-shell
   resource_group: ml-inference-service-production
+  needs: [test_service]
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:

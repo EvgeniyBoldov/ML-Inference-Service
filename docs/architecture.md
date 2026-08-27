@@ -30,7 +30,7 @@ deployments but must not interrupt predictions for already active models.
 | MLflow adapter | Resolves model URI, metadata, signature, example, and artifact loading |
 | Schema adapter | Converts MLflow signatures to JSON Schema |
 | Routing service | Atomically reads and switches active/previous deployments |
-| Runtime backend | Isolated lifecycle: deploy, load, predict, health, drain, stop |
+| Fleet runtime backend | Lifecycle одного изолированного контейнера для полного набора active-моделей |
 | Repositories | Persistent deployments, routes, idempotency records |
 
 ## Deployment lifecycle
@@ -46,16 +46,19 @@ CREATED → DOWNLOADING → LOADING → WARMING_UP → READY → ACTIVE
 former ACTIVE → DRAINING → STANDBY → REMOVED
 ```
 
-For a new version, the manager validates the MLflow contract (registered model,
-version, loadable artifact, signature, input example, and description), selects
-the free blue/green slot, creates an isolated runtime, loads it, runs health and
-example-based output-schema checks, and warms it up. Only then does it perform an
-atomic route switch. The former active runtime drains existing requests and stays
-in `STANDBY` for the configured rollback TTL.
+Для новой версии менеджер проверяет контракт MLflow (registered model, version,
+loadable artifact, signature, input example и description), формирует полный
+набор active-моделей с кандидатом и создаёт GREEN fleet. Это один изолированный
+контейнер, который загружает все модели из общего immutable base image. Он
+проходит healthcheck и prediction/output-schema smoke test **для каждой** модели
+fleet. Только затем сервис атомарно меняет указатель на fleet. BLUE fleet
+дожидается старых запросов и хранится до rollback TTL.
 
 If any candidate step fails, it becomes `FAILED`; the existing active route is
 unchanged. Rollback atomically swaps `active_deployment_id` and
-`previous_deployment_id` while the previous runtime still exists.
+`previous_deployment_id` while the previous runtime still exists. В fleet-модели
+rollback намеренно доступен только для последнего fleet-перехода: это исключает
+подмену маршрута версией, которой уже нет в retained runtime.
 
 ## Runtime boundary
 
@@ -64,16 +67,21 @@ technology:
 
 ```python
 class RuntimeBackend(Protocol):
-    async def deploy(self, deployment: Deployment) -> RuntimeHandle: ...
+    async def deploy(self, models: list[ModelMetadata]) -> RuntimeHandle: ...
     async def load(self, runtime: RuntimeHandle) -> None: ...
-    async def predict(self, runtime: RuntimeHandle, payload: object) -> object: ...
+    async def predict(self, runtime: RuntimeHandle, model: str, payload: object) -> object: ...
     async def health(self, runtime: RuntimeHandle) -> bool: ...
     async def drain(self, runtime: RuntimeHandle) -> None: ...
     async def stop(self, runtime: RuntimeHandle) -> None: ...
 ```
 
-The MVP can provide a process-based backend. A container or Kubernetes backend
-must be interchangeable without changing routers, routing, or domain services.
+Production backend `DockerFleetRuntimeBackend` starts one Docker container per
+BLUE/GREEN fleet from the digest in `/etc/ml-inference-service/runtime-base.env`.
+Artifacts are first downloaded through MLflow into a shared host cache and are
+mounted read-only into fleet containers. Пакеты в production не устанавливаются:
+изменение зависимостей требует выпуска нового base image. Изоляция сохраняется
+между fleet и FastAPI, но не между отдельными моделями; совместимость всех
+active-моделей с одним набором зависимостей — обязательное правило платформы.
 
 ## Persistence
 
@@ -87,9 +95,8 @@ the configured runtime backend.
 The current implementation contains a PostgreSQL SQLAlchemy repository selected
 by `INFERENCE_DATABASE_URL`; it persists deployment, route, idempotency, and
 normalized model metadata rows. `MLFLOW_TRACKING_URI` selects the MLflow metadata
-adapter and PyFunc runtime adapter. The included PyFunc runtime is suitable only
-when service and model dependencies are compatible; process/container isolation
-is still the required production backend for heterogeneous model environments.
+adapter. On restart the service reconstructs the active fleet from persisted
+active metadata without contacting MLflow.
 
 ## API and security
 
@@ -110,6 +117,9 @@ ID, status, total latency, model latency, gateway overhead, and timestamp. Raw
 inputs and outputs are excluded by default. Export the metrics in the technical
 specification with model/version/status labels. `/health/live` reports process
 liveness; `/health/ready` reports that the service can accept inference traffic.
+Если в PostgreSQL есть active-модели, readiness требует успешно восстановленный
+и healthy fleet; поэтому Nginx не переключится на FastAPI-релиз без работающих
+runtime-контейнеров.
 
 ## MVP delivery sequence
 

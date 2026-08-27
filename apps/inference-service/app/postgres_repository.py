@@ -56,11 +56,6 @@ class SqlAlchemyDeploymentRepository:
         self._engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True)
         self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
 
-    async def initialize(self) -> None:
-        """Convenience bootstrap. Production deploys the matching Alembic migration."""
-        async with self._engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-
     async def dispose(self) -> None:
         await self._engine.dispose()
 
@@ -119,6 +114,14 @@ class SqlAlchemyDeploymentRepository:
             )).all()
             return [_from_row(row) for row in rows]
 
+    async def list_incomplete(self) -> list[Deployment]:
+        async with self._sessions() as session:
+            rows = (await session.scalars(select(DeploymentRow).where(DeploymentRow.status.in_([
+                DeploymentStatus.CREATED.value, DeploymentStatus.DOWNLOADING.value, DeploymentStatus.LOADING.value,
+                DeploymentStatus.WARMING_UP.value, DeploymentStatus.READY.value,
+            ])))).all()
+            return [_from_row(row) for row in rows]
+
     async def activate(self, candidate: Deployment) -> Deployment | None:
         async with self._sessions.begin() as session:
             candidate_row = await session.get(DeploymentRow, candidate.id, with_for_update=True)
@@ -146,6 +149,8 @@ class SqlAlchemyDeploymentRepository:
             active_row = await session.get(DeploymentRow, route.active_deployment_id, with_for_update=True)
             previous_row = await session.get(DeploymentRow, route.previous_deployment_id, with_for_update=True)
             assert active_row is not None and previous_row is not None
+            if previous_row.status != DeploymentStatus.STANDBY.value:
+                raise LookupError("Previous deployment is no longer available")
             active_row.status, previous_row.status = DeploymentStatus.STANDBY.value, DeploymentStatus.ACTIVE.value
             route.active_deployment_id, route.previous_deployment_id = previous_row.id, active_row.id
             return _from_row(previous_row), _from_row(active_row)
@@ -174,7 +179,7 @@ def _metadata_to_json(metadata: ModelMetadata | None) -> dict[str, Any] | None:
     return {
         "name": metadata.name, "version": metadata.version, "uri": metadata.uri, "description": metadata.description,
         "owner": metadata.owner, "input_schema": metadata.input_schema, "output_schema": metadata.output_schema,
-        "input_example": metadata.input_example, "created_at": metadata.created_at,
+        "input_example": metadata.input_example, "artifact_path": metadata.artifact_path, "created_at": metadata.created_at,
     }
 
 

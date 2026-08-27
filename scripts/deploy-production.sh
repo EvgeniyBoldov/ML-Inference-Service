@@ -14,6 +14,7 @@ nginx_upstream="/etc/nginx/conf.d/ml-inference-service-upstream.conf"
 die() { echo "deploy: $*" >&2; exit 1; }
 [[ -f "$manifest" && -f "$compose_source" ]] || die "release manifest or compose source is missing"
 [[ -f "$runtime_env" ]] || die "production runtime env is missing: $runtime_env"
+docker network inspect ml-inference-runtime >/dev/null 2>&1 || docker network create ml-inference-runtime >/dev/null
 
 set -a
 . "$manifest"
@@ -59,6 +60,7 @@ install -m 0644 "$compose_source" "$release_dir/compose.yaml"
 install -m 0644 "$manifest" "$release_dir/release.env"
 
 SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" pull
+SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" run --rm inference-service alembic upgrade head
 SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" up -d --remove-orphans
 
 for _ in $(seq 1 24); do
