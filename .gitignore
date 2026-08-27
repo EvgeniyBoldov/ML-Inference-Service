@@ -1,0 +1,56 @@
+# Local agent/workspace instructions
+AGENTS.md
+.agents/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*.secrets
+tokens
+runtime.env
+runtime-base.env
+
+# Model artifacts and local runtime state
+model-artifacts/
+artifacts/
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Docker and local tooling
+.docker/
+docker-compose.override.yml
+*.log
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
