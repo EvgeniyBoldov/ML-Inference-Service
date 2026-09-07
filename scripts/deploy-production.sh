@@ -23,6 +23,22 @@ for required in RELEASE_VERSION RELEASE_COMMIT REGISTRY IMAGE BLUE_PORT GREEN_PO
   [[ -n "${!required:-}" ]] || die "$required is required in release.env"
 done
 
+set -a
+. "$runtime_env"
+set +a
+for required in INFERENCE_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD; do
+  [[ -n "${!required:-}" ]] || die "$required is required in runtime environment"
+done
+
+SLOT_PORT=1 docker compose --project-name ml-inference-postgres --env-file "$runtime_env" -f "$compose_source" up -d postgres
+for _ in $(seq 1 24); do
+  if SLOT_PORT=1 docker compose --project-name ml-inference-postgres --env-file "$runtime_env" -f "$compose_source" exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+SLOT_PORT=1 docker compose --project-name ml-inference-postgres --env-file "$runtime_env" -f "$compose_source" exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null || die "PostgreSQL is not ready"
+
 release_dir="$project_root/releases/$RELEASE_VERSION"
 project_name="ml-inference-${RELEASE_VERSION//./-}"
 active_slot=""
@@ -60,8 +76,8 @@ install -m 0644 "$compose_source" "$release_dir/compose.yaml"
 install -m 0644 "$manifest" "$release_dir/release.env"
 
 SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" pull
-SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" run --rm inference-service alembic upgrade head
-SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" up -d --remove-orphans
+SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" run --rm --no-deps inference-service alembic upgrade head
+SLOT_PORT="$candidate_port" docker compose --project-name "$project_name" --env-file "$release_dir/release.env" -f "$release_dir/compose.yaml" up -d --remove-orphans --no-deps inference-service
 
 for _ in $(seq 1 24); do
   if curl --fail --silent --show-error "http://127.0.0.1:$candidate_port/health/ready" >/dev/null; then

@@ -49,8 +49,11 @@ To request major/minor, edit `RELEASE_VERSION` to an `X.Y.0` base. The next
 
 Before the first deployment, provision:
 
-- `/etc/ml-inference-service/runtime.env` with MLflow, PostgreSQL, and service
-  secrets; set `INFERENCE_DATABASE_URL` and `MLFLOW_TRACKING_URI` there.
+- `/etc/ml-inference-service/runtime.env` with MLflow, PostgreSQL, and service secrets; set
+  `INFERENCE_DATABASE_URL=postgresql+asyncpg://ml_inference:<password>@postgres:5432/ml_inference`
+  plus `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `MLFLOW_TRACKING_URI`
+  there. The deployment job starts PostgreSQL from the common Compose file before
+  applying migrations.
 - `/etc/ml-inference-service/tokens`, created with
   `scripts/manage-inference-token.sh`; it is mounted read-only into the service.
 - `/etc/ml-inference-service/runtime-base.env`, copied by the runtime-base

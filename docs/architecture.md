@@ -85,7 +85,8 @@ active-моделей с одним набором зависимостей — 
 
 ## Persistence
 
-PostgreSQL is the intended persistent store. At minimum persist deployment ID,
+PostgreSQL is the persistent store. In the supplied delivery topology it runs as
+one durable Compose project shared by both blue/green service slots. At minimum persist deployment ID,
 model name, model version, MLflow URI, slot, status, runtime ID, timestamps, and
 error details. Store a route per logical model with active and previous deployment
 IDs. Persist model metadata used by discovery and validation alongside a successful

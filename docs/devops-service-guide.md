@@ -17,8 +17,10 @@ Production VM ничего не собирает и не устанавлива�
 
 ## Однократная подготовка production VM
 
-Нужны Docker Engine и Compose plugin, GitLab shell runner, Nginx, PostgreSQL и
-сетевой доступ к внутреннему MLflow, MinIO через MLflow и registry. Runner должен
+Нужны Docker Engine и Compose plugin, GitLab shell runner, Nginx и сетевой доступ
+к внутреннему MLflow, MinIO через MLflow и registry. PostgreSQL описан в общем
+Compose-файле; deployment job запускает его один раз под постоянным именем
+проекта, отдельно от blue/green service slots. Runner должен
 иметь Docker access и ограниченный passwordless `sudo` для `install`, `nginx -t`
 и `systemctl reload nginx`.
 
@@ -34,7 +36,10 @@ sudo docker network create ml-inference-runtime || true
 Пример обязательных значений `/etc/ml-inference-service/runtime.env`:
 
 ```dotenv
-INFERENCE_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@POSTGRES_HOST:5432/ml_inference
+INFERENCE_DATABASE_URL=postgresql+asyncpg://ml_inference:PASSWORD@postgres:5432/ml_inference
+POSTGRES_DB=ml_inference
+POSTGRES_USER=ml_inference
+POSTGRES_PASSWORD=PASSWORD
 MLFLOW_TRACKING_URI=http://mlflow.internal
 MODEL_ARTIFACT_CACHE_ROOT=/var/lib/ml-inference-service/model-artifacts
 MODEL_RUNTIME_BASE_FILE=/etc/ml-inference-service/runtime-base.env
@@ -42,6 +47,9 @@ MODEL_FLEET_MEMORY_LIMIT=24g
 MODEL_FLEET_CPU_LIMIT=8
 PREVIOUS_RUNTIME_TTL_SECONDS=3600
 ```
+
+`PASSWORD` в URL должен соответствовать `POSTGRES_PASSWORD`; URL не должен
+содержать неэкранированные символы `@`, `:`, `/` или `#`.
 
 Значения MLflow/MinIO credentials добавляются тем же защищённым файлом по правилам
 конкретной установки MLflow. Права на Docker socket эквивалентны root; поэтому
@@ -84,7 +92,8 @@ git push origin main
 
 ## Что выполняет GitLab pipeline
 
-Pipeline на production shell runner копирует compose и `release.env` в
+Pipeline на production shell runner сначала поднимает и ожидает PostgreSQL из
+общего Compose-файла под постоянным проектом `ml-inference-postgres`, затем копирует compose и `release.env` в
 `/opt/ml-inference-service/releases/<версия>`, запускает Alembic на candidate
 image, поднимает неактивный BLUE/GREEN slot, проверяет
 `/health/ready`, затем атомарно меняет Nginx upstream. Старый slot остаётся
