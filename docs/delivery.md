@@ -16,9 +16,22 @@ DevOps workstation ─ make release ─> production registry
                          host Nginx → 127.0.0.1:18001 (blue) or :18002 (green)
 ```
 
-The GitLab runner must run on the production VM and have Docker access plus
-passwordless, tightly-scoped `sudo` permission for `install` into
-`/etc/ml-inference-service`, `nginx -t`, and `systemctl reload nginx`.
+The GitLab runner must run on the production VM without Docker access. It may
+invoke only the root-owned `/usr/local/sbin/ml-inference-deploy` controller
+through passwordless, tightly-scoped `sudo`.
+
+The controller reads root-owned `/etc/ml-inference-service/controller.env`:
+
+```dotenv
+APP_ROOT=/opt/ml-inference-service
+ETC_ROOT=/etc/ml-inference-service
+CI_BUILDS_ROOT=/builds
+```
+
+Install `scripts/production-controller.sh` as `root:root`, mode `0750`, and
+allow the runner to execute only `ml-inference-deploy deploy|rollback|status`.
+The controller stages only the compose file, release manifest and deploy
+helpers into `/opt/ml-inference-service/releases/<commit-sha>`.
 
 ## Release manifest
 
@@ -94,7 +107,6 @@ The state file separately records active and standby projects; the next deployme
 reclaims only that inactive standby slot, never the active one, before starting a
 candidate.
 
-To roll back, rerun the GitLab deploy job for the Git commit holding the desired
-`release.env`. It deploys that immutable image into the inactive slot, checks it,
-and switches Nginx back atomically. A failed candidate never changes the active
-upstream.
+To roll back, use the manual `rollback-production` job from the supplied
+`gitlab-ci.example.yml`. It promotes the healthy standby release and swaps the
+Nginx upstream atomically. Database migrations remain forward-only.

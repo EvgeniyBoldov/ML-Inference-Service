@@ -1,0 +1,66 @@
+# Copy to .gitlab-ci.yml in the production GitLab repository.
+stages:
+  - validate
+  - deploy
+
+validate-production-release:
+  stage: validate
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - release.env
+        - infra/compose/inference-service.compose.yaml
+        - scripts/release-common.sh
+        - scripts/deploy.sh
+        - scripts/production-controller.sh
+  script:
+    - bash -n scripts/release-common.sh scripts/deploy.sh scripts/production-controller.sh
+    - bash -c 'source scripts/release-common.sh; load_release_file release.env'
+
+deploy-production:
+  stage: deploy
+  tags:
+    - production
+  resource_group: ml-inference-production
+  environment:
+    name: production
+  variables:
+    GIT_STRATEGY: fetch
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - release.env
+        - infra/compose/inference-service.compose.yaml
+  when: manual
+  allow_failure: false
+  manual_confirmation: "Deploy this immutable inference release to production?"
+  before_script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+    - test -f release.env
+    - test -x /usr/local/sbin/ml-inference-deploy
+  script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy deploy --source "$CI_PROJECT_DIR" --release "$CI_COMMIT_SHA"
+  after_script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy status > deployment-status.env || true
+  artifacts:
+    when: always
+    expire_in: 90 days
+    paths:
+      - deployment-status.env
+
+rollback-production:
+  stage: deploy
+  tags:
+    - production
+  resource_group: ml-inference-production
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - release.env
+  when: manual
+  allow_failure: false
+  manual_confirmation: "Restore the previous inference release? Database migrations are not rolled back."
+  script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy rollback
