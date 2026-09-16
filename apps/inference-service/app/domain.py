@@ -45,6 +45,7 @@ class Deployment:
     status: DeploymentStatus = DeploymentStatus.CREATED
     metadata: ModelMetadata | None = None
     runtime_id: str | None = None
+    runtime_image: str | None = None
     created_at: int = field(default_factory=lambda: int(time()))
     activated_at: int | None = None
     failed_at: int | None = None

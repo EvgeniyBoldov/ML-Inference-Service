@@ -97,6 +97,11 @@ def test_deploy_discover_predict_and_rollback_contract() -> None:
                     break
                 await asyncio.sleep(0)
             assert upgraded_status.json()["status"] == "active"
+            former = await client.get(f"/internal/v1/deployments/{deployment_id}", headers={"Authorization": "Bearer deploy"})
+            assert former.json()["status"] == "standby"
+            upgraded_response = await client.post("/v1/responses", headers={"Authorization": "Bearer predict"}, json={"model": "credit-scoring", "input": {"age": 20}})
+            assert upgraded_response.json()["model_version"] == "19"
+            assert upgraded_response.json()["output"][0]["content"] == {"prediction": 0}
             rollback = await client.post(f"/internal/v1/deployments/{upgraded_id}/rollback", headers={"Authorization": "Bearer deploy"})
             assert rollback.status_code == 200
             assert rollback.json()["version"] == "18"

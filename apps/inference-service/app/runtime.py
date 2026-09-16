@@ -17,10 +17,11 @@ from .domain import ModelMetadata
 class RuntimeHandle:
     id: str
     models: dict[str, ModelMetadata]
+    image: str | None = None
 
 
 class RuntimeBackend(Protocol):
-    async def deploy(self, models: list[ModelMetadata]) -> RuntimeHandle: ...
+    async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle: ...
     async def load(self, runtime: RuntimeHandle) -> None: ...
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any: ...
     async def health(self, runtime: RuntimeHandle) -> bool: ...
@@ -34,8 +35,8 @@ class PredictorRuntimeBackend:
     def __init__(self, predictors: dict[str, Any] | None = None) -> None:
         self._predictors = predictors or {}
 
-    async def deploy(self, models: list[ModelMetadata]) -> RuntimeHandle:
-        return RuntimeHandle(f"runtime_{uuid4().hex}", {model.name: model for model in models})
+    async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle:
+        return RuntimeHandle(runtime_id or f"runtime_{uuid4().hex}", {model.name: model for model in models}, image)
 
     async def load(self, runtime: RuntimeHandle) -> None:
         missing = [model.uri for model in runtime.models.values() if model.uri not in self._predictors]
@@ -83,16 +84,26 @@ class DockerFleetRuntimeBackend:
         self._startup_timeout = startup_timeout_seconds
         self._containers: dict[str, str] = {}
 
-    async def deploy(self, models: list[ModelMetadata]) -> RuntimeHandle:
+    async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle:
         if not models:
             raise RuntimeError("A fleet must contain at least one model")
         for model in models:
             if not model.artifact_path:
                 raise RuntimeError(f"Model artifact is not cached for {model.name}")
-        return RuntimeHandle(f"fleet_{uuid4().hex}", {model.name: model for model in models})
+        return RuntimeHandle(runtime_id or f"fleet_{uuid4().hex}", {model.name: model for model in models}, image or self._read_image())
 
     async def load(self, runtime: RuntimeHandle) -> None:
-        image = self._read_image()
+        image = runtime.image
+        if not image:
+            raise RuntimeError("Fleet runtime image is missing")
+        name = runtime.id.replace("_", "-")
+        inspect_status, _ = await self._docker("inspect", name, check=False)
+        if inspect_status == 0:
+            self._containers[runtime.id] = name
+            if await self.health(runtime):
+                return
+            await self._docker("rm", "-f", name, check=False)
+            self._containers.pop(runtime.id, None)
         self._cache_root.mkdir(parents=True, exist_ok=True)
         manifest_path = self._cache_root / f"{runtime.id}.json"
         manifest_path.write_text(json.dumps({"models": [
@@ -101,8 +112,8 @@ class DockerFleetRuntimeBackend:
         ]}), encoding="utf-8")
         if (await self._docker("network", "inspect", self._network, check=False))[0] != 0:
             await self._docker("network", "create", self._network)
-        name = runtime.id.replace("_", "-")
-        args = ["run", "-d", "--rm", "--name", name, "--network", self._network]
+        args = ["run", "-d", "--rm", "--name", name, "--network", self._network,
+                "--label", "ml-inference-service.runtime=fleet", "--label", f"ml-inference-service.fleet-id={runtime.id}"]
         if self._memory_limit:
             args.extend(["--memory", self._memory_limit])
         if self._cpu_limit:
@@ -133,8 +144,8 @@ class DockerFleetRuntimeBackend:
 
     async def stop(self, runtime: RuntimeHandle) -> None:
         name = self._containers.pop(runtime.id, None)
-        if name:
-            await self._docker("rm", "-f", name, check=False)
+        await self._docker("rm", "-f", name or runtime.id.replace("_", "-"), check=False)
+        (self._cache_root / f"{runtime.id}.json").unlink(missing_ok=True)
 
     async def _docker(self, *args: str, check: bool = True) -> tuple[int, str]:
         process = await asyncio.create_subprocess_exec("docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

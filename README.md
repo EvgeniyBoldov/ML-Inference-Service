@@ -36,6 +36,8 @@ MLflow-backed model metadata, isolated runtimes, and blue/green traffic switchin
   выпуск FastAPI-образа, GitLab delivery и откат.
 - [DevOps: base runtime](docs/devops-runtime-base-guide.md) — выпуск общего
   образа зависимостей моделей и его применение к полному fleet.
+- [DevOps: эксплуатация](docs/devops-operations.md) — короткий runbook VM,
+  выпусков, отката и расположения production-файлов.
 - [Development guide](apps/inference-service/README.md) — code-package layout
   and intended implementation sequence.
 

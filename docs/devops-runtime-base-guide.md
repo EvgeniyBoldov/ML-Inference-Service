@@ -43,12 +43,17 @@ git push origin main
 
 ## Доставка manifest на production
 
-Изменение `projects/model-runtime-base/**` запускает отдельную GitLab job. Она
-копирует `base.env` на VM в:
+Коммит готового `projects/model-runtime-base/base.env` запускает отдельную
+ручную GitLab job `deploy-runtime-base-config`. Она вызывает тот же root-owned
+controller, что и основной deployment, и копирует `base.env` на VM в:
 
 ```text
 /etc/ml-inference-service/runtime-base.env
 ```
+
+Job принимает только `RUNTIME_BASE_IMAGE`, закреплённый sha256 digest; manifest
+с `REPLACE_AFTER_RELEASE` не будет установлен. Runner не получает прямой доступ
+к Docker или `/etc`.
 
 Это только меняет manifest следующего fleet rollout; существующий BLUE runtime
 не перезапускается и остаётся на старом image. Проверьте:

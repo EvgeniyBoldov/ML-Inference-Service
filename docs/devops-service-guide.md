@@ -20,9 +20,10 @@ Production VM ничего не собирает и не устанавлива�
 Нужны Docker Engine и Compose plugin, GitLab shell runner, Nginx и сетевой доступ
 к внутреннему MLflow, MinIO через MLflow и registry. PostgreSQL описан в общем
 Compose-файле; deployment job запускает его один раз под постоянным именем
-проекта, отдельно от blue/green service slots. Runner должен
-иметь Docker access и ограниченный passwordless `sudo` для `install`, `nginx -t`
-и `systemctl reload nginx`.
+проекта, отдельно от blue/green service slots. Runner **не должен** иметь
+доступ к Docker socket или прямой `sudo` к `install`, `nginx` и `systemctl`.
+Ему разрешён только passwordless вызов root-owned
+`/usr/local/sbin/ml-inference-deploy deploy|rollback|status|runtime-base`.
 
 Создайте host-owned конфигурацию:
 
@@ -46,6 +47,7 @@ MODEL_RUNTIME_BASE_FILE=/etc/ml-inference-service/runtime-base.env
 MODEL_FLEET_MEMORY_LIMIT=24g
 MODEL_FLEET_CPU_LIMIT=8
 PREVIOUS_RUNTIME_TTL_SECONDS=3600
+FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS=180
 ```
 
 `PASSWORD` в URL должен соответствовать `POSTGRES_PASSWORD`; URL не должен
@@ -99,6 +101,10 @@ image, поднимает неактивный BLUE/GREEN slot, проверяе
 `/health/ready`, затем атомарно меняет Nginx upstream. Старый slot остаётся
 standby до следующего выпуска.
 
+`DEPLOY_WAIT_TIMEOUT` controller по умолчанию равен 300 секундам и должен быть
+больше `FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS`, чтобы cold start fleet не был
+ложно признан неуспешным.
+
 `/health/ready` не станет успешным, если в PostgreSQL есть active-модели, но
 новый сервис не восстановил healthy fleet. Поэтому переключение Nginx не может
 направить трафик на сервис без работающих моделей.
@@ -113,9 +119,10 @@ curl --fail http://127.0.0.1:<active-port>/health/ready
 
 ## Откат основного сервиса
 
-Откат — повторный запуск deploy job GitLab для коммита, содержащего нужный
-`release.env`. Job поднимет старый immutable image в неактивном slot, проверит
-его и переключит Nginx. Не редактируйте вручную
+Штатный откат — ручная job `rollback-production`. Она повторно проверяет
+healthy standby release и атомарно переключает на него Nginx. Это доступно,
+пока standby не был вытеснен следующим deployment. Job не откатывает миграции
+БД. Не редактируйте вручную
 `/etc/ml-inference-service/active-release.env` и upstream-файл во время job.
 
 ## Диагностика

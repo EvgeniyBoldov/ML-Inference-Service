@@ -10,7 +10,7 @@ RUNTIME_ENV="${ML_INFERENCE_RUNTIME_ENV:-${ETC_ROOT}/runtime.env}"
 STATE_FILE="${ML_INFERENCE_STATE_FILE:-${ETC_ROOT}/active-release.env}"
 NGINX_UPSTREAM="${ML_INFERENCE_NGINX_UPSTREAM:-/etc/nginx/conf.d/ml-inference-service-upstream.conf}"
 RELEASE_DIR=""
-DEPLOY_WAIT_TIMEOUT="${DEPLOY_WAIT_TIMEOUT:-180}"
+DEPLOY_WAIT_TIMEOUT="${DEPLOY_WAIT_TIMEOUT:-300}"
 usage() { cat >&2 <<'EOF'
 Usage:
   deploy.sh deploy --release-dir DIR

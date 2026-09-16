@@ -29,7 +29,8 @@ CI_BUILDS_ROOT=/builds
 ```
 
 Install `scripts/production-controller.sh` as `root:root`, mode `0750`, and
-allow the runner to execute only `ml-inference-deploy deploy|rollback|status`.
+allow the runner to execute only
+`ml-inference-deploy deploy|rollback|status|runtime-base`.
 The controller stages only the compose file, release manifest and deploy
 helpers into `/opt/ml-inference-service/releases/<commit-sha>`.
 
@@ -80,6 +81,12 @@ Before the first deployment, provision:
   example, then validate/reload Nginx.
 - Docker and Compose plugin; registry access is unauthenticated by current
   infrastructure decision.
+
+The versioned manifests in a fresh repository intentionally contain no release
+commit/base digest. They are not deployable initial configuration: first publish
+the application with `make release`, publish the runtime base with
+`make runtime-base-release`, review the resulting manifests, and commit them
+before enabling either production job.
 
 The deployment job executes `alembic upgrade head` using the candidate image
 before it starts the candidate service. The database URL is read only from the

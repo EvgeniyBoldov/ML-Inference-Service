@@ -47,14 +47,22 @@ def create_app(
             repository = InMemoryDeploymentRepository()
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
     artifact_cache_root = os.getenv("MODEL_ARTIFACT_CACHE_ROOT")
+    runtime_base_file = os.getenv("MODEL_RUNTIME_BASE_FILE")
+    configured_runtime_values = (tracking_uri, artifact_cache_root, runtime_base_file)
+    if any(configured_runtime_values) and not all(configured_runtime_values):
+        raise RuntimeError(
+            "MLFLOW_TRACKING_URI, MODEL_ARTIFACT_CACHE_ROOT, and MODEL_RUNTIME_BASE_FILE "
+            "must be configured together for the production fleet runtime"
+        )
     source = source or (MlflowModelSource(tracking_uri, artifact_cache_root) if tracking_uri else UnavailableModelSource())
     runtime = runtime or (
         DockerFleetRuntimeBackend(
-            image_manifest=os.environ["MODEL_RUNTIME_BASE_FILE"],
+            image_manifest=runtime_base_file,
             artifact_cache_root=os.environ["MODEL_ARTIFACT_CACHE_ROOT"],
             memory_limit=os.getenv("MODEL_FLEET_MEMORY_LIMIT"),
             cpu_limit=os.getenv("MODEL_FLEET_CPU_LIMIT"),
-        ) if tracking_uri and artifact_cache_root and os.getenv("MODEL_RUNTIME_BASE_FILE") else PredictorRuntimeBackend()
+            startup_timeout_seconds=float(os.getenv("FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS", "180")),
+        ) if tracking_uri else PredictorRuntimeBackend()
     )
 
     @asynccontextmanager

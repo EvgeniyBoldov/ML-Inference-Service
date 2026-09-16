@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import dataclass
 from time import perf_counter, time
 from typing import Any
 from uuid import uuid4
@@ -15,6 +17,14 @@ from .model_source import ModelSource
 from .metrics import ServiceMetrics
 from .repositories import DeploymentRepository
 from .runtime import RuntimeBackend, RuntimeHandle
+
+
+@dataclass(frozen=True)
+class FleetSnapshot:
+    """A prediction-safe pairing of one runtime and its exact model routes."""
+
+    runtime: RuntimeHandle
+    deployments: dict[str, Deployment]
 
 
 class DeploymentManager:
@@ -32,7 +42,9 @@ class DeploymentManager:
         self._active_fleet_deployments: dict[str, Deployment] = {}
         self._previous_fleet_deployments: dict[str, Deployment] = {}
         self._fleet_lock = asyncio.Lock()
+        self._active_snapshot: FleetSnapshot | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        self._logger = logging.getLogger("ml_inference")
 
     async def create(self, model: str, uri: str, idempotency_key: str) -> Deployment:
         version = _version_from_uri(model, uri)
@@ -81,6 +93,7 @@ class DeploymentManager:
                 self._previous_fleet_deployments,
                 self._active_fleet_deployments,
             )
+            self._active_snapshot = FleetSnapshot(self._active_fleet, dict(self._active_fleet_deployments))
             standby_fleet = self._previous_fleet
         if standby_fleet:
             self._schedule(self._expire_previous_fleet(standby_fleet, _former_active), f"expire_{_former_active.id}")
@@ -107,6 +120,7 @@ class DeploymentManager:
             fleet_models.append(metadata)
             runtime = await self._runtime.deploy(fleet_models)
             deployment.runtime_id = runtime.id
+            deployment.runtime_image = runtime.image
             await self._runtime.load(runtime)
             if not await self._runtime.health(runtime):
                 raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Runtime healthcheck failed", status_code=502)
@@ -121,8 +135,13 @@ class DeploymentManager:
             previous = await self._repository.activate(deployment)
             deployment.activated_at = int(time())
             await self._repository.save(deployment)
+            # ``activate`` turns the former version of this model into STANDBY.
+            # Never save its stale in-memory ACTIVE record back over that state.
             for existing in current:
+                if existing.model == deployment.model:
+                    continue
                 existing.runtime_id = runtime.id
+                existing.runtime_image = runtime.image
                 await self._repository.save(existing)
             async with self._fleet_lock:
                 previous_fleet = self._active_fleet
@@ -132,6 +151,7 @@ class DeploymentManager:
                 }
                 self._active_fleet_deployments[deployment.model] = deployment
                 self._active_fleet = runtime
+                self._active_snapshot = FleetSnapshot(runtime, dict(self._active_fleet_deployments))
                 self._previous_fleet = previous_fleet
             self._metrics.deployments.labels(deployment.model, deployment.version, "active").inc()
             self._metrics.model_load_duration.labels(deployment.model, deployment.version).observe(perf_counter() - started_at)
@@ -178,14 +198,14 @@ class DeploymentManager:
             await self._runtime.stop(runtime)
 
     async def active(self, model: str) -> tuple[Deployment, RuntimeHandle]:
-        deployment = await self._repository.active_for(model)
-        if not deployment:
-            raise ServiceError("MODEL_NOT_FOUND", f"Model '{model}' is not active", status_code=404, param="model")
         async with self._fleet_lock:
-            runtime = self._active_fleet
-        if not runtime:
+            snapshot = self._active_snapshot
+        if snapshot is None:
             raise ServiceError("RUNTIME_UNAVAILABLE", "Active model runtime is unavailable", status_code=503)
-        return deployment, runtime
+        deployment = snapshot.deployments.get(model)
+        if deployment is None:
+            raise ServiceError("MODEL_NOT_FOUND", f"Model '{model}' is not active", status_code=404, param="model")
+        return deployment, snapshot.runtime
 
     async def catalog(self) -> list[Deployment]:
         return await self._repository.list_active()
@@ -196,8 +216,8 @@ class DeploymentManager:
         if not active:
             return True
         async with self._fleet_lock:
-            runtime = self._active_fleet
-        return runtime is not None and await self._runtime.health(runtime)
+            snapshot = self._active_snapshot
+        return snapshot is not None and await self._runtime.health(snapshot.runtime)
 
     async def restore(self) -> None:
         """Recreate persisted active/standby handles after a service restart.
@@ -209,29 +229,48 @@ class DeploymentManager:
         active = await self._repository.list_active()
         if active and all(item.metadata for item in active):
             try:
-                runtime = await self._runtime.deploy([item.metadata for item in active if item.metadata])
+                images = {item.runtime_image for item in active}
+                runtime_ids = {item.runtime_id for item in active}
+                if None in images or len(images) != 1:
+                    raise RuntimeError("Persisted active fleet has no single pinned runtime image")
+                if None in runtime_ids or len(runtime_ids) != 1:
+                    raise RuntimeError("Persisted active fleet has no single runtime ID")
+                runtime = await self._runtime.deploy(
+                    [item.metadata for item in active if item.metadata],
+                    image=images.pop(), runtime_id=runtime_ids.pop(),
+                )
                 await self._runtime.load(runtime)
                 if await self._runtime.health(runtime):
+                    for item in active:
+                        assert item.metadata is not None
+                        output = await self._runtime.predict(runtime, item.model, item.metadata.input_example)
+                        _validate_output(item.metadata.output_schema, output)
                     self._active_fleet = runtime
                     self._active_fleet_deployments = {item.model: item for item in active}
-                    for deployment in active:
-                        deployment.runtime_id = runtime.id
-                        await self._repository.save(deployment)
+                    self._active_snapshot = FleetSnapshot(runtime, dict(self._active_fleet_deployments))
+                else:
+                    await self._runtime.stop(runtime)
+                    raise RuntimeError("Restored fleet healthcheck failed")
             except Exception:
-                pass
+                self._logger.exception("fleet_restore_failed", extra={"models": [item.model for item in active]})
         for deployment in await self._repository.list_incomplete():
             self._schedule(self._run(deployment), f"recover_{deployment.id}")
 
     async def shutdown(self) -> None:
-        """Stop runtime containers owned by this control-plane instance."""
+        """Release local handles without killing the persisted active fleet.
+
+        A replacement FastAPI container may already have attached to that fleet.
+        Failed candidates and expired standbys are still explicitly stopped.
+        """
         for task in tuple(self._tasks):
             task.cancel()
         async with self._fleet_lock:
-            runtimes = {runtime.id: runtime for runtime in (self._active_fleet, self._previous_fleet) if runtime}
+            previous = self._previous_fleet
             self._active_fleet = None
             self._previous_fleet = None
-        for runtime in runtimes.values():
-            await self._runtime.stop(runtime)
+            self._active_snapshot = None
+        if previous:
+            await self._runtime.stop(previous)
 
     def _schedule(self, coroutine: Any, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)

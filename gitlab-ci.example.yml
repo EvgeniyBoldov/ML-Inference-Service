@@ -48,6 +48,29 @@ deploy-production:
     paths:
       - deployment-status.env
 
+deploy-runtime-base-config:
+  stage: deploy
+  tags:
+    - production
+  resource_group: ml-inference-production
+  environment:
+    name: production
+  variables:
+    GIT_STRATEGY: fetch
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - projects/model-runtime-base/base.env
+  when: manual
+  allow_failure: false
+  manual_confirmation: "Install the pinned model-runtime base manifest on production?"
+  before_script:
+    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
+    - test -f projects/model-runtime-base/base.env
+    - test -x /usr/local/sbin/ml-inference-deploy
+  script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy runtime-base --source "$CI_PROJECT_DIR" --release "$CI_COMMIT_SHA"
+
 rollback-production:
   stage: deploy
   tags:

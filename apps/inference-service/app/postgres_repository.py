@@ -26,6 +26,7 @@ class DeploymentRow(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     runtime_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    runtime_image: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     activated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     failed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -87,7 +88,7 @@ class SqlAlchemyDeploymentRepository:
                 raise LookupError("Deployment was not found")
             replacement = _to_row(deployment)
             for field in (
-                "model", "version", "uri", "slot", "status", "metadata_json", "runtime_id", "created_at",
+                "model", "version", "uri", "slot", "status", "metadata_json", "runtime_id", "runtime_image", "created_at",
                 "activated_at", "failed_at", "error_code", "error_message",
             ):
                 setattr(row, field, getattr(replacement, field))
@@ -159,7 +160,7 @@ class SqlAlchemyDeploymentRepository:
 def _to_row(deployment: Deployment) -> DeploymentRow:
     return DeploymentRow(
         id=deployment.id, model=deployment.model, version=deployment.version, uri=deployment.uri, slot=deployment.slot,
-        status=deployment.status.value, metadata_json=_metadata_to_json(deployment.metadata), runtime_id=deployment.runtime_id,
+        status=deployment.status.value, metadata_json=_metadata_to_json(deployment.metadata), runtime_id=deployment.runtime_id, runtime_image=deployment.runtime_image,
         created_at=deployment.created_at, activated_at=deployment.activated_at, failed_at=deployment.failed_at,
         error_code=deployment.error_code, error_message=deployment.error_message,
     )
@@ -168,7 +169,7 @@ def _to_row(deployment: Deployment) -> DeploymentRow:
 def _from_row(row: DeploymentRow) -> Deployment:
     return Deployment(
         id=row.id, model=row.model, version=row.version, uri=row.uri, slot=row.slot, status=DeploymentStatus(row.status),
-        metadata=_metadata_from_json(row.metadata_json), runtime_id=row.runtime_id, created_at=row.created_at,
+        metadata=_metadata_from_json(row.metadata_json), runtime_id=row.runtime_id, runtime_image=row.runtime_image, created_at=row.created_at,
         activated_at=row.activated_at, failed_at=row.failed_at, error_code=row.error_code, error_message=row.error_message,
     )
 
