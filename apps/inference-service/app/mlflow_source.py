@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .domain import ModelMetadata
 from .errors import ServiceError
@@ -17,6 +19,7 @@ class MlflowModelSource:
     """Read registry metadata and artifacts exclusively through MLflow APIs."""
 
     def __init__(self, tracking_uri: str | None = None, artifact_cache_root: str | None = None) -> None:
+        validate_artifact_storage_config()
         self._tracking_uri = tracking_uri
         self._artifact_cache_root = Path(artifact_cache_root) if artifact_cache_root else None
 
@@ -79,11 +82,39 @@ def _parse_model_uri(model: str, uri: str) -> tuple[str, str]:
 
 
 def _download_model(mlflow: Any, uri: str, cache_root: Path | None, name: str, version: str) -> Path:
-    if cache_root is None:
-        return Path(mlflow.artifacts.download_artifacts(artifact_uri=uri))
-    destination = cache_root / name / version
-    destination.mkdir(parents=True, exist_ok=True)
-    return Path(mlflow.artifacts.download_artifacts(artifact_uri=uri, dst_path=str(destination)))
+    from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, BotoCoreError
+
+    kwargs: dict[str, Any] = {"artifact_uri": uri}
+    if cache_root is not None:
+        destination = cache_root / name / version
+        destination.mkdir(parents=True, exist_ok=True)
+        kwargs["dst_path"] = str(destination)
+    try:
+        return Path(mlflow.artifacts.download_artifacts(**kwargs))
+    except (NoCredentialsError, PartialCredentialsError) as exc:
+        raise ServiceError("ARTIFACT_CREDENTIALS_MISSING", "Artifact storage credentials are unavailable", status_code=503) from exc
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "ExpiredToken"}:
+            raise ServiceError("ARTIFACT_AUTH_FAILED", "Artifact storage rejected the configured credentials", status_code=502) from exc
+        raise ServiceError("ARTIFACT_STORAGE_UNAVAILABLE", "Unable to download model artifacts", status_code=503) from exc
+    except BotoCoreError as exc:
+        raise ServiceError("ARTIFACT_STORAGE_UNAVAILABLE", "Unable to reach artifact storage", status_code=503) from exc
+
+
+def validate_artifact_storage_config() -> None:
+    """MLflow/boto3 use the standard AWS environment credential chain for MinIO."""
+    access_key = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+    if bool(access_key) != bool(secret_key):
+        raise RuntimeError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be configured together")
+    endpoint = os.getenv("MLFLOW_S3_ENDPOINT_URL", "").strip()
+    if endpoint:
+        parsed = urlsplit(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+            raise RuntimeError("MLFLOW_S3_ENDPOINT_URL must be an HTTP(S) server URL without credentials or a bucket path")
+        if not (access_key and secret_key) and not (os.getenv("AWS_PROFILE") or os.getenv("AWS_SHARED_CREDENTIALS_FILE")):
+            raise RuntimeError("MinIO requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or an explicitly configured AWS credential profile/file")
 
 
 def _load_input_example(local_dir: Path, model_info: Any) -> Any:

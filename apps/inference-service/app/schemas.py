@@ -37,7 +37,7 @@ class ModelList(BaseModel):
 
 
 class ResponseRequest(BaseModel):
-    model: str = Field(min_length=1)
+    model: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     input: Any
 
 
@@ -58,11 +58,11 @@ class ResponseObject(BaseModel):
 
 class DeploymentSource(BaseModel):
     type: Literal["mlflow"]
-    uri: str = Field(min_length=1)
+    uri: str = Field(min_length=1, max_length=1024)
 
 
 class DeploymentRequest(BaseModel):
-    model: str = Field(min_length=1)
+    model: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     source: DeploymentSource
 
 
@@ -73,4 +73,3 @@ class DeploymentObject(BaseModel):
     version: str
     status: str
     error: dict[str, str] | None = None
-

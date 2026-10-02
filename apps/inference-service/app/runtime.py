@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from uuid import uuid4
 
 from .domain import ModelMetadata
+from .errors import ServiceError
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,7 @@ class RuntimeHandle:
     id: str
     models: dict[str, ModelMetadata]
     image: str | None = None
+    attach_existing: bool = False
 
 
 class RuntimeBackend(Protocol):
@@ -75,6 +78,8 @@ class DockerFleetRuntimeBackend:
         memory_limit: str | None = None,
         cpu_limit: str | None = None,
         startup_timeout_seconds: float = 180.0,
+        command_timeout_seconds: float = 30.0,
+        prediction_timeout_seconds: float = 30.0,
     ) -> None:
         self._image_manifest = Path(image_manifest)
         self._cache_root = Path(artifact_cache_root).resolve()
@@ -82,6 +87,10 @@ class DockerFleetRuntimeBackend:
         self._memory_limit = memory_limit
         self._cpu_limit = cpu_limit
         self._startup_timeout = startup_timeout_seconds
+        if min(startup_timeout_seconds, command_timeout_seconds, prediction_timeout_seconds) <= 0:
+            raise ValueError("Runtime timeouts must be positive")
+        self._command_timeout = command_timeout_seconds
+        self._prediction_timeout = prediction_timeout_seconds
         self._containers: dict[str, str] = {}
 
     async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle:
@@ -90,7 +99,7 @@ class DockerFleetRuntimeBackend:
         for model in models:
             if not model.artifact_path:
                 raise RuntimeError(f"Model artifact is not cached for {model.name}")
-        return RuntimeHandle(runtime_id or f"fleet_{uuid4().hex}", {model.name: model for model in models}, image or self._read_image())
+        return RuntimeHandle(runtime_id or f"fleet_{uuid4().hex}", {model.name: model for model in models}, image or self._read_image(), attach_existing=runtime_id is not None)
 
     async def load(self, runtime: RuntimeHandle) -> None:
         image = runtime.image
@@ -102,6 +111,8 @@ class DockerFleetRuntimeBackend:
             self._containers[runtime.id] = name
             if await self.health(runtime):
                 return
+            if runtime.attach_existing:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Persisted runtime is unhealthy", status_code=503)
             await self._docker("rm", "-f", name, check=False)
             self._containers.pop(runtime.id, None)
         self._cache_root.mkdir(parents=True, exist_ok=True)
@@ -119,15 +130,17 @@ class DockerFleetRuntimeBackend:
         if self._cpu_limit:
             args.extend(["--cpus", self._cpu_limit])
         args.extend(["-v", f"{self._cache_root}:/models:ro", "-e", f"MODEL_MANIFEST=/models/{manifest_path.name}", image])
-        await self._docker(*args)
+        # Register before starting Docker so cancellation can clean up a container
+        # created by the daemon even if the client never received its response.
         self._containers[runtime.id] = name
+        await self._docker(*args)
         deadline = asyncio.get_running_loop().time() + self._startup_timeout
         while asyncio.get_running_loop().time() < deadline:
             if await self.health(runtime):
                 return
             await asyncio.sleep(2)
         await self.stop(runtime)
-        raise RuntimeError("Fleet runtime did not become healthy")
+        raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Fleet runtime did not become healthy", status_code=502)
 
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any:
         return await asyncio.to_thread(self._http_json, runtime, "/predict", {"model": model, "input": payload})
@@ -143,13 +156,25 @@ class DockerFleetRuntimeBackend:
         return None
 
     async def stop(self, runtime: RuntimeHandle) -> None:
-        name = self._containers.pop(runtime.id, None)
-        await self._docker("rm", "-f", name or runtime.id.replace("_", "-"), check=False)
+        name = self._containers.get(runtime.id, runtime.id.replace("_", "-"))
+        status, _ = await self._docker("rm", "-f", name, check=False)
+        if status != 0 and (await self._docker("inspect", name, check=False))[0] == 0:
+            raise ServiceError("RUNTIME_CLEANUP_FAILED", "Unable to remove runtime container", status_code=503)
+        self._containers.pop(runtime.id, None)
         (self._cache_root / f"{runtime.id}.json").unlink(missing_ok=True)
 
     async def _docker(self, *args: str, check: bool = True) -> tuple[int, str]:
         process = await asyncio.create_subprocess_exec("docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self._command_timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.communicate()
+            raise
         output = (stdout + stderr).decode(errors="replace").strip()
         if check and process.returncode:
             raise RuntimeError(f"Docker runtime command failed: {output}")
@@ -170,11 +195,33 @@ class DockerFleetRuntimeBackend:
         return "/models/" + str(artifact.resolve().relative_to(self._cache_root))
 
     def _http_json(self, runtime: RuntimeHandle, path: str, payload: dict[str, Any] | None) -> Any:
-        name = self._containers[runtime.id]
+        name = self._containers.get(runtime.id)
+        if name is None:
+            raise ServiceError("RUNTIME_UNAVAILABLE", "Runtime container is unavailable", status_code=503)
         data = json.dumps(payload).encode() if payload is not None else None
         request = Request(f"http://{name}:8080{path}", data=data, headers={"Content-Type": "application/json"}, method="POST" if payload else "GET")
-        with urlopen(request, timeout=30) as response:
-            body = json.loads(response.read())
-        if path == "/predict":
-            return body["output"]
-        return body
+        try:
+            with urlopen(request, timeout=self._prediction_timeout if path == "/predict" else 2) as response:
+                raw = response.read(16 * 1024 * 1024 + 1)
+                if len(raw) > 16 * 1024 * 1024:
+                    raise ValueError("Runtime response exceeds 16 MiB")
+                body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise ValueError("Runtime response must be an object")
+            if path == "/predict":
+                return body["output"]
+            if body.get("status") != "ok" or set(body.get("models", [])) != set(runtime.models):
+                raise ValueError("Runtime health does not match the requested fleet")
+            return body
+        except HTTPError as exc:
+            if exc.code in {429, 503}:
+                raise ServiceError("SERVICE_OVERLOADED", "Runtime prediction capacity is unavailable", status_code=503) from exc
+            raise ServiceError("MODEL_PREDICTION_FAILED", "Runtime rejected the prediction request", status_code=502) from exc
+        except TimeoutError as exc:
+            raise ServiceError("MODEL_PREDICTION_TIMEOUT", "Runtime request timed out", status_code=504) from exc
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise ServiceError("MODEL_PREDICTION_TIMEOUT", "Runtime request timed out", status_code=504) from exc
+            raise ServiceError("RUNTIME_UNAVAILABLE", "Unable to reach runtime", status_code=503) from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ServiceError("RUNTIME_INVALID_RESPONSE", "Runtime returned an invalid response", status_code=502) from exc

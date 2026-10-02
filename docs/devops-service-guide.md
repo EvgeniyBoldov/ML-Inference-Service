@@ -41,6 +41,11 @@ POSTGRES_DB=ml_inference
 POSTGRES_USER=ml_inference
 POSTGRES_PASSWORD=PASSWORD
 MLFLOW_TRACKING_URI=http://mlflow.internal
+# Для прямого скачивания артефактов из MinIO (s3://):
+MLFLOW_S3_ENDPOINT_URL=https://minio.internal:9000
+AWS_ACCESS_KEY_ID=MINIO_SERVICE_ACCESS_KEY
+AWS_SECRET_ACCESS_KEY=MINIO_SERVICE_SECRET_KEY
+AWS_DEFAULT_REGION=us-east-1
 MODEL_ARTIFACT_CACHE_ROOT=/var/lib/ml-inference-service/model-artifacts
 MODEL_FLEET_MEMORY_LIMIT=24g
 MODEL_FLEET_CPU_LIMIT=8
@@ -51,8 +56,23 @@ FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS=180
 `PASSWORD` в URL должен соответствовать `POSTGRES_PASSWORD`; URL не должен
 содержать неэкранированные символы `@`, `:`, `/` или `#`.
 
-Значения MLflow/MinIO credentials добавляются тем же защищённым файлом по правилам
-конкретной установки MLflow. Права на Docker socket эквивалентны root; поэтому
+Compose передаёт весь защищённый `runtime.env` в API-контейнер через `env_file`.
+MLflow и boto3 читают указанные AWS-переменные для авторизации в MinIO. Используйте
+отдельный MinIO service account с правами чтения нужного bucket; замените
+`MINIO_SERVICE_ACCESS_KEY` и `MINIO_SERVICE_SECRET_KEY` его значениями. Секреты
+не добавляются в Git, release manifest, логи или ответы status-эндпоинта.
+При заданном `MLFLOW_S3_ENDPOINT_URL` сервис проверяет наличие пары ключей или
+явно настроенного AWS profile/credentials file. Неполная пара ключей останавливает
+запуск. Проверка конфигурации не подтверждает сетевой доступ или права на bucket:
+ошибки доступа обнаруживаются при скачивании артефактов.
+
+Если MLflow проксирует артефакты через `mlflow-artifacts:/`, MinIO credentials
+задаются на MLflow server; в API не задавайте `MLFLOW_S3_ENDPOINT_URL` и MinIO keys.
+Runtime моделей получает уже скачанные артефакты через read-only mount и не
+получает MinIO credentials. Для внутреннего CA настройте `AWS_CA_BUNDLE` и
+read-only mount сертификата в API.
+
+Права на Docker socket эквивалентны root; поэтому
 сервисный контейнер намеренно получает этот доступ только на выделенной VM.
 
 Создайте токены, не добавляя их в Git:

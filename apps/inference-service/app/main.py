@@ -10,7 +10,10 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
 from .auth import FileTokenAuth, StaticTokenAuth
 from .domain import Deployment
@@ -62,6 +65,8 @@ def create_app(
             memory_limit=os.getenv("MODEL_FLEET_MEMORY_LIMIT"),
             cpu_limit=os.getenv("MODEL_FLEET_CPU_LIMIT"),
             startup_timeout_seconds=float(os.getenv("FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS", "180")),
+            command_timeout_seconds=float(os.getenv("DOCKER_COMMAND_TIMEOUT_SECONDS", "30")),
+            prediction_timeout_seconds=float(os.getenv("PREDICTION_TIMEOUT_SECONDS", "30")),
         ) if tracking_uri else PredictorRuntimeBackend()
     )
 
@@ -70,27 +75,81 @@ def create_app(
         initialize = getattr(repository, "initialize", None)
         if initialize:
             await initialize()
-        await manager.restore()
-        yield
-        await manager.shutdown()
-        dispose = getattr(repository, "dispose", None)
-        if dispose:
-            await dispose()
+        try:
+            await manager.restore()
+            yield
+        finally:
+            try:
+                await manager.shutdown()
+            finally:
+                dispose = getattr(repository, "dispose", None)
+                if dispose:
+                    await dispose()
 
     app = FastAPI(title="ML Inference Service", version="0.1.0", lifespan=lifespan)
     metrics = ServiceMetrics()
-    manager = DeploymentManager(repository, source, runtime, metrics, previous_ttl_seconds=int(os.getenv("PREVIOUS_RUNTIME_TTL_SECONDS", "3600")))
-    prediction = PredictionService(manager, runtime)
+    manager = DeploymentManager(repository, source, runtime, metrics, previous_ttl_seconds=int(os.getenv("PREVIOUS_RUNTIME_TTL_SECONDS", "3600")), max_pending_deployments=int(os.getenv("MAX_PENDING_DEPLOYMENTS", "32")))
+    prediction = PredictionService(manager, runtime, timeout_seconds=float(os.getenv("PREDICTION_TIMEOUT_SECONDS", "30")), max_concurrent=int(os.getenv("MAX_CONCURRENT_PREDICTIONS", "64")))
     auth = auth or (FileTokenAuth(os.environ["INFERENCE_TOKEN_FILE"]) if os.getenv("INFERENCE_TOKEN_FILE") else StaticTokenAuth())
     app.state.deployment_manager = manager
     app.state.metrics = metrics
 
+    @app.middleware("http")
+    async def request_context(request: Request, call_next: Any) -> Response:
+        request.state.request_id = f"req_{uuid4().hex}"
+        started = perf_counter()
+        status_code = 500
+        metrics.http_in_progress.inc()
+        try:
+            result = await call_next(request)
+            status_code = result.status_code
+            result.headers["X-Request-ID"] = request.state.request_id
+            return result
+        finally:
+            elapsed = perf_counter() - started
+            route = getattr(request.scope.get("route"), "path", "unmatched")
+            method = request.method if request.method in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"} else "OTHER"
+            metrics.http_requests.labels(method, route, str(status_code)).inc()
+            metrics.http_latency.labels(method, route).observe(elapsed)
+            metrics.http_in_progress.dec()
+            logger.info("http_request_completed", extra={"request_id": request.state.request_id, "method": method, "route": route, "status_code": status_code, "latency_ms": round(elapsed * 1000, 3)})
+
+    def error_response(request: Request, exc: ServiceError) -> JSONResponse:
+        headers = {"X-Request-ID": getattr(request.state, "request_id", f"req_{uuid4().hex}")}
+        if exc.status_code == 401:
+            headers["WWW-Authenticate"] = "Bearer"
+        return JSONResponse(status_code=exc.status_code, headers=headers, content={
+            "error": {"message": exc.message, "type": exc.error_type, "param": exc.param, "code": exc.code},
+        })
+
     @app.exception_handler(ServiceError)
-    async def service_error_handler(_request: Request, exc: ServiceError) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"message": exc.message, "type": exc.error_type, "param": exc.param, "code": exc.code}},
-        )
+    async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
+        return error_response(request, exc)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        error = exc.errors()[0]
+        location = error.get("loc", ())
+        param = ".".join(str(part) for part in location if part != "body") or "body"
+        return error_response(request, ServiceError("SCHEMA_VALIDATION_ERROR", error["msg"], param=param))
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        codes = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED", 413: "REQUEST_TOO_LARGE"}
+        response = error_response(request, ServiceError(codes.get(exc.status_code, "HTTP_ERROR"), str(exc.detail), status_code=exc.status_code))
+        if exc.headers:
+            response.headers.update(exc.headers)
+        return response
+
+    @app.exception_handler(SQLAlchemyError)
+    async def database_error_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+        logger.error("database_request_failed", exc_info=exc, extra={"request_id": request.state.request_id})
+        return error_response(request, ServiceError("STORAGE_UNAVAILABLE", "Deployment storage is unavailable", status_code=503))
+
+    @app.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.error("request_failed", exc_info=exc, extra={"request_id": getattr(request.state, "request_id", None)})
+        return error_response(request, ServiceError("INTERNAL_ERROR", "An internal service error occurred", status_code=500))
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -106,6 +165,10 @@ def create_app(
     async def prometheus_metrics(_: None = Depends(auth.require("metrics.read"))) -> Response:
         return Response(metrics.exposition(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
+    @app.get("/internal/v1/status")
+    async def service_status(_: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
+        return {**await manager.operational_status(), **metrics.request_statistics()}
+
     @app.get("/v1/models", response_model=ModelList, responses={401: {"model": ErrorResponse}})
     async def list_models(_: None = Depends(auth.require("inference.read"))) -> ModelList:
         deployments = await manager.catalog()
@@ -117,14 +180,15 @@ def create_app(
         return _model_object(deployment, include_deployment=True)
 
     @app.post("/v1/responses", response_model=ResponseObject, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
-    async def response(body: ResponseRequest, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:
-        request_id = f"req_{uuid4().hex}"
+    async def response(body: ResponseRequest, request: Request, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:
+        request_id = request.state.request_id
         started_at = perf_counter()
         try:
             deployment, output, model_latency = await prediction.predict(body.model, body.input)
         except ServiceError as exc:
-            metrics.prediction_errors.labels(body.model, "unknown", exc.code).inc()
-            metrics.prediction_requests.labels(body.model, "unknown", "error").inc()
+            metric_model = manager.metric_model(body.model)
+            metrics.prediction_errors.labels(metric_model, "unknown", exc.code).inc()
+            metrics.prediction_requests.labels(metric_model, "unknown", "error").inc()
             logger.info("prediction_failed", extra={"request_id": request_id, "model": body.model, "status": "error", "code": exc.code})
             raise
         total_latency = perf_counter() - started_at
@@ -142,8 +206,8 @@ def create_app(
         _: None = Depends(auth.require("deployment.write")),
     ) -> DeploymentObject:
         key = request.headers.get("Idempotency-Key")
-        if not key:
-            raise ServiceError("SCHEMA_VALIDATION_ERROR", "Idempotency-Key header is required", param="Idempotency-Key")
+        if not key or not key.strip() or len(key) > 255:
+            raise ServiceError("SCHEMA_VALIDATION_ERROR", "Idempotency-Key must contain 1 to 255 characters", param="Idempotency-Key")
         deployment = await manager.create(body.model, body.source.uri, key)
         return _deployment_object(deployment)
 
@@ -159,7 +223,7 @@ def create_app(
         deployment = await manager.get(deployment_id)
         if deployment is None:
             raise ServiceError("DEPLOYMENT_NOT_FOUND", "Deployment was not found", status_code=404, param="deployment_id")
-        active = await manager.rollback(deployment.model)
+        active = await manager.rollback(deployment.model, expected_deployment_id=deployment_id)
         return _deployment_object(active)
 
     return app

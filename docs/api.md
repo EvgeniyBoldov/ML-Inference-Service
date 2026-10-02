@@ -35,6 +35,8 @@ The response identifies the actual model version that served the request:
 | `POST` | `/internal/v1/deployments` | `deployment.write` | Begin an asynchronous MLflow deployment |
 | `GET` | `/internal/v1/deployments/{deployment_id}` | `deployment.read` | Poll deployment result |
 | `POST` | `/internal/v1/deployments/{deployment_id}/rollback` | `deployment.write` | Restore the previous successful runtime |
+| `GET` | `/internal/v1/status` | `metrics.read` | Service readiness and request statistics in JSON |
+| `GET` | `/metrics` | `metrics.read` | Request, prediction and deployment metrics in Prometheus format |
 
 The deployment create request requires a logical model name and an unambiguous
 MLflow source URI. It returns `202 Accepted`. Clients must provide an
@@ -55,4 +57,3 @@ Important codes: `MODEL_NOT_FOUND`, `MODEL_NOT_READY`, `MODEL_NOT_ACTIVE`,
 `MODEL_HEALTHCHECK_FAILED`, `MODEL_WARMUP_FAILED`,
 `MODEL_OUTPUT_VALIDATION_FAILED`, `DEPLOYMENT_NOT_FOUND`, `DEPLOYMENT_FAILED`,
 `RUNTIME_UNAVAILABLE`, `MLFLOW_UNAVAILABLE`, and `INTERNAL_ERROR`.
-

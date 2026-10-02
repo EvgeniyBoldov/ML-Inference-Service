@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
+from hashlib import sha256
 
-from sqlalchemy import BigInteger, JSON, String, select
+from sqlalchemy import BigInteger, JSON, String, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .domain import Deployment, DeploymentStatus, ModelMetadata
+from .errors import ServiceError
 
 
 class Base(DeclarativeBase):
@@ -54,21 +56,25 @@ class SqlAlchemyDeploymentRepository:
     """Repository with row-level locking around durable active/previous switches."""
 
     def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True)
+        self._engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True, pool_timeout=5, connect_args={"timeout": 5, "command_timeout": 15})
         self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
 
     async def dispose(self) -> None:
         await self._engine.dispose()
 
-    async def create_or_get(self, deployment: Deployment, idempotency_key: str, request_fingerprint: str) -> tuple[Deployment, bool]:
+    async def create_or_get(self, deployment: Deployment, idempotency_key: str, request_fingerprint: str, *, allow_create: bool = True) -> tuple[Deployment, bool]:
         async with self._sessions.begin() as session:
+            lock_key = int.from_bytes(sha256(idempotency_key.encode()).digest()[:8], "big", signed=True)
+            await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
             existing = await session.get(IdempotencyRow, idempotency_key, with_for_update=True)
             if existing:
-                if existing.request_fingerprint != request_fingerprint:
+                if existing.request_fingerprint not in {request_fingerprint, f"{deployment.model}:{deployment.uri}"}:
                     raise ValueError("Idempotency-Key was already used with a different deployment request")
                 row = await session.get(DeploymentRow, existing.deployment_id)
                 assert row is not None
                 return _from_row(row), False
+            if not allow_create:
+                raise ServiceError("DEPLOYMENT_QUEUE_FULL", "Deployment queue is full", status_code=503)
             route = await session.get(RouteRow, deployment.model, with_for_update=True)
             active = await session.get(DeploymentRow, route.active_deployment_id) if route and route.active_deployment_id else None
             deployment.slot = "green" if active is None or active.slot == "blue" else "blue"
@@ -123,7 +129,7 @@ class SqlAlchemyDeploymentRepository:
             ])))).all()
             return [_from_row(row) for row in rows]
 
-    async def activate(self, candidate: Deployment) -> Deployment | None:
+    async def activate(self, candidate: Deployment, fleet: list[Deployment] | None = None) -> Deployment | None:
         async with self._sessions.begin() as session:
             candidate_row = await session.get(DeploymentRow, candidate.id, with_for_update=True)
             if candidate_row is None:
@@ -137,12 +143,21 @@ class SqlAlchemyDeploymentRepository:
             if previous_row:
                 previous_row.status = DeploymentStatus.STANDBY.value
             candidate_row.status = DeploymentStatus.ACTIVE.value
+            candidate_row.activated_at = candidate.activated_at
+            for item in fleet or []:
+                if item.model != candidate.model:
+                    row = await session.get(DeploymentRow, item.id, with_for_update=True)
+                    if row is None:
+                        raise LookupError("Fleet deployment was not found")
+                    row.runtime_id = candidate.runtime_id
+                    row.runtime_image = candidate.runtime_image
             route.active_deployment_id = candidate.id
             route.previous_deployment_id = previous_row.id if previous_row else None
-            candidate.status = DeploymentStatus.ACTIVE
-            return _from_row(previous_row) if previous_row else None
+            previous = _from_row(previous_row) if previous_row else None
+        candidate.status = DeploymentStatus.ACTIVE
+        return previous
 
-    async def rollback(self, model: str) -> tuple[Deployment, Deployment]:
+    async def rollback(self, model: str, fleet: list[Deployment] | None = None) -> tuple[Deployment, Deployment]:
         async with self._sessions.begin() as session:
             route = await session.get(RouteRow, model, with_for_update=True)
             if not route or not route.active_deployment_id or not route.previous_deployment_id:
@@ -154,6 +169,15 @@ class SqlAlchemyDeploymentRepository:
                 raise LookupError("Previous deployment is no longer available")
             active_row.status, previous_row.status = DeploymentStatus.STANDBY.value, DeploymentStatus.ACTIVE.value
             route.active_deployment_id, route.previous_deployment_id = previous_row.id, active_row.id
+            for item in fleet or []:
+                row = await session.get(DeploymentRow, item.id, with_for_update=True)
+                item_route = await session.get(RouteRow, item.model, with_for_update=True)
+                if row is None or item_route is None:
+                    raise LookupError("Fleet deployment route was not found")
+                row.runtime_id = item.runtime_id
+                row.runtime_image = item.runtime_image
+                row.status = DeploymentStatus.ACTIVE.value
+                item_route.active_deployment_id = item.id
             return _from_row(previous_row), _from_row(active_row)
 
 
