@@ -1,7 +1,6 @@
 # Инструкция DevOps: основной Inference Service
 
-Документ описывает выпуск и доставку контейнера FastAPI. Он не описывает
-зависимости моделей: для них используется отдельный base runtime image, см.
+Документ описывает выпуск и доставку контейнера FastAPI. Зависимости API и моделей устанавливаются в общий base по requirements, см.
 [`devops-runtime-base-guide.md`](devops-runtime-base-guide.md).
 
 ## Границы ответственности
@@ -23,7 +22,7 @@ Compose-файле; deployment job запускает его один раз п�
 проекта, отдельно от blue/green service slots. Runner **не должен** иметь
 доступ к Docker socket или прямой `sudo` к `install`, `nginx` и `systemctl`.
 Ему разрешён только passwordless вызов root-owned
-`/usr/local/sbin/ml-inference-deploy deploy|rollback|status|runtime-base`.
+`/usr/local/sbin/ml-inference-deploy deploy|rollback|status`.
 
 Создайте host-owned конфигурацию:
 
@@ -43,7 +42,6 @@ POSTGRES_USER=ml_inference
 POSTGRES_PASSWORD=PASSWORD
 MLFLOW_TRACKING_URI=http://mlflow.internal
 MODEL_ARTIFACT_CACHE_ROOT=/var/lib/ml-inference-service/model-artifacts
-MODEL_RUNTIME_BASE_FILE=/etc/ml-inference-service/runtime-base.env
 MODEL_FLEET_MEMORY_LIMIT=24g
 MODEL_FLEET_CPU_LIMIT=8
 PREVIOUS_RUNTIME_TTL_SECONDS=3600
@@ -78,16 +76,13 @@ git pull --ff-only
 make test
 make release-preview
 make release
-git diff -- release.env
-git add release.env
-git commit -m "release: <версия>"
-git push origin main
 ```
 
 `make release` требует чистый закоммиченный tree, автоматически повышает patch,
-собирает и пушит образ с тегами версии и SHA, и записывает точный commit в
-`release.env`. Для major/minor заранее вручную задайте в `release.env` версию
-`X.Y.0`; следующая команда выпустит `X.Y.1`.
+проверяет хеш Dockerfile/requirements, при необходимости собирает новый base,
+собирает и пушит API/runtime, записывает версии и digest в `release.env`,
+коммитит и пушит manifest в upstream ветки. Для major/minor заранее задайте
+и закоммитьте в `release.env` версию `X.Y.0`; следующая команда выпустит `X.Y.1`.
 
 Не меняйте `RELEASE_COMMIT` вручную. Не добавляйте в `release.env` пароли,
 токены или адреса внутренних секретных хранилищ.
@@ -98,8 +93,8 @@ Pipeline на production shell runner сначала поднимает и ож�
 общего Compose-файла под постоянным проектом `ml-inference-postgres`, затем копирует compose и `release.env` в
 `/opt/ml-inference-service/releases/<версия>`, запускает Alembic на candidate
 image, поднимает неактивный BLUE/GREEN slot, проверяет
-`/health/ready`, затем атомарно меняет Nginx upstream. Старый slot остаётся
-standby до следующего выпуска.
+`/health/ready`, затем атомарно меняет Nginx upstream. После переключения старый API останавливается; его bundle сохраняется для rollback.
+Runtime manifest фиксируется отдельно для каждой версии в её release directory.
 
 `DEPLOY_WAIT_TIMEOUT` controller по умолчанию равен 300 секундам и должен быть
 больше `FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS`, чтобы cold start fleet не был
@@ -113,14 +108,14 @@ standby до следующего выпуска.
 
 ```bash
 sudo cat /etc/ml-inference-service/active-release.env
-docker compose --project-directory /opt/ml-inference-service/releases/<версия> ps
+sudo /usr/local/sbin/ml-inference-deploy status
 curl --fail http://127.0.0.1:<active-port>/health/ready
 ```
 
 ## Откат основного сервиса
 
-Штатный откат — ручная job `rollback-production`. Она повторно проверяет
-healthy standby release и атомарно переключает на него Nginx. Это доступно,
+Штатный откат — ручная job `rollback_production`. Она повторно проверяет
+сохранённый standby release: запускает его, проверяет readiness и атомарно переключает на него Nginx. Это доступно,
 пока standby не был вытеснен следующим deployment. Job не откатывает миграции
 БД. Не редактируйте вручную
 `/etc/ml-inference-service/active-release.env` и upstream-файл во время job.
@@ -132,8 +127,8 @@ healthy standby release и атомарно переключает на него
 | Candidate не проходит `/health/ready` | Посмотреть `docker compose logs inference-service`; Nginx останется на старом slot. |
 | Ошибка Alembic | Исправить миграцию/DB доступ; candidate не поднимется. |
 | Нет доступа к registry | Проверить сетевую доступность VM и наличие image digest в registry. |
-| Runtime не стартует | Проверить `runtime-base.env`, Docker socket, сеть `ml-inference-runtime`, cache-directory и лимиты памяти. |
+| Runtime не стартует | Проверить runtime manifest текущего release bundle, Docker socket, сеть `ml-inference-runtime`, cache-directory и лимиты памяти. |
 | Prediction работает, deployment нет | Проверить MLflow/artifact storage; active fleet не зависит от MLflow. |
 
-Для изменения Python-зависимостей моделей не пересобирайте основной сервис:
-используйте процедуру base image.
+Для изменения Python-зависимостей моделей добавьте пакеты в общий requirements
+и выполните полный `make release`: base пересоберётся автоматически.

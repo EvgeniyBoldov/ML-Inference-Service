@@ -1,0 +1,14 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG RELEASE_VERSION
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.title="ML Inference Model Runtime" \
+      org.opencontainers.image.version="${RELEASE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}"
+
+WORKDIR /runtime
+COPY runner.py ./
+USER runtime
+EXPOSE 8080
+CMD ["uvicorn", "runner:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -20,12 +20,35 @@ require_command() { command -v "$1" >/dev/null 2>&1 || fail "Required command is
 load_release_file() {
   local file="$1"
   test -f "$file" || fail "Missing release manifest: $file"
-  awk '/^[[:space:]]*($|#)/ { next } /^[A-Z][A-Z0-9_]*=[-A-Za-z0-9._:\/]*$/ { key=$0; sub(/=.*/, "", key); if (seen[key]++) exit 1; next } { exit 1 }' "$file" || fail "Release manifest contains invalid or duplicate entries: $file"
+  awk '/^[[:space:]]*($|#)/ { next } /^[A-Z][A-Z0-9_]*=[-A-Za-z0-9._:\/@]*$/ { key=$0; sub(/=.*/, "", key); if (seen[key]++) exit 1; next } { exit 1 }' "$file" || fail "Release manifest contains invalid or duplicate entries: $file"
   set -a; source "$file"; set +a
-  for key in RELEASE_VERSION RELEASE_COMMIT REGISTRY IMAGE BLUE_PORT GREEN_PORT; do [[ -n "${!key:-}" ]] || fail "$key is required in release.env"; done
+  local key
+  for key in RELEASE_VERSION REGISTRY IMAGE BLUE_PORT GREEN_PORT; do [[ -n "${!key:-}" ]] || fail "$key is required in release.env"; done
   [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "RELEASE_VERSION must be X.Y.Z"
-  [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{7,64}$ ]] || fail "RELEASE_COMMIT must be a Git commit SHA"
+  if [[ "${2:-}" != bootstrap ]]; then
+    [[ "${RELEASE_COMMIT:-}" =~ ^[0-9a-f]{7,64}$ ]] || fail "RELEASE_COMMIT must be a Git commit SHA"
+  fi
+  if [[ "${2:-}" != bootstrap && "${2:-}" != legacy ]]; then
+    [[ "${BASE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "BASE_VERSION must be X.Y.Z"
+    [[ "${BASE_INPUT_SHA256:-}" =~ ^[a-f0-9]{64}$ ]] || fail "BASE_INPUT_SHA256 must be a SHA256"
+    [[ "${BASE_IMAGE:-}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "BASE_IMAGE must be pinned by digest"
+    [[ "${RUNTIME_IMAGE:-}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "RUNTIME_IMAGE must be pinned by digest"
+    [[ "${DB_REVISION:-}" =~ ^[A-Za-z0-9_]+$ ]] || fail "DB_REVISION is required"
+  fi
   [[ "$BLUE_PORT" =~ ^[0-9]+$ && "$GREEN_PORT" =~ ^[0-9]+$ ]] || fail "BLUE_PORT and GREEN_PORT must be numeric"
+}
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+base_input_sha() {
+  local dockerfile_sha requirements_sha
+  dockerfile_sha="$(hash_file "$REPO_ROOT/projects/model-runtime-base/Dockerfile")"
+  requirements_sha="$(hash_file "$REPO_ROOT/projects/model-runtime-base/requirements.txt")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf 'Dockerfile=%s\nrequirements.txt=%s\n' "$dockerfile_sha" "$requirements_sha" | sha256sum | awk '{print $1}'
+  else
+    printf 'Dockerfile=%s\nrequirements.txt=%s\n' "$dockerfile_sha" "$requirements_sha" | shasum -a 256 | awk '{print $1}'
+  fi
 }
 require_clean_worktree() {
   git -C "$REPO_ROOT" diff --quiet || fail "Working tree has unstaged changes."

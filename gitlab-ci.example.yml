@@ -1,89 +1,54 @@
-# Copy to .gitlab-ci.yml in the production GitLab repository.
+# Example production pipeline; keep in sync with .gitlab-ci.yml.
 stages:
-  - validate
+  - test
   - deploy
 
-validate-production-release:
-  stage: validate
+test_service:
+  stage: test
+  tags: [production-shell]
+  script:
+    - bash -n scripts/release.sh scripts/release-common.sh scripts/deploy.sh scripts/production-controller.sh
+    - bash -c 'source scripts/release-common.sh; load_release_file release.env'
+    - python3 -m unittest discover -s scripts/tests -q
+    - PYTHONPATH=apps/inference-service python3 -m unittest discover -s apps/inference-service/tests -p test_delivery_logging.py -q
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+deploy_production:
+  stage: deploy
+  tags:
+    - production-shell
+  resource_group: ml-inference-service-production
+  needs: [test_service]
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - release.env
         - infra/compose/inference-service.compose.yaml
+        - scripts/deploy-production.sh
         - scripts/release-common.sh
         - scripts/deploy.sh
         - scripts/production-controller.sh
   script:
-    - bash -n scripts/release-common.sh scripts/deploy.sh scripts/production-controller.sh
-    - bash -c 'source scripts/release-common.sh; load_release_file release.env'
-
-deploy-production:
-  stage: deploy
-  tags:
-    - production
-  resource_group: ml-inference-production
+    - test -f release.env
+    - test -f infra/compose/inference-service.compose.yaml
+    - bash scripts/deploy-production.sh
   environment:
     name: production
-  variables:
-    GIT_STRATEGY: fetch
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - release.env
-        - infra/compose/inference-service.compose.yaml
-  when: manual
-  allow_failure: false
-  manual_confirmation: "Deploy this immutable inference release to production?"
-  before_script:
-    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
-    - test -f release.env
-    - test -x /usr/local/sbin/ml-inference-deploy
-  script:
-    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy deploy --source "$CI_PROJECT_DIR" --release "$CI_COMMIT_SHA"
   after_script:
     - sudo --non-interactive /usr/local/sbin/ml-inference-deploy status > deployment-status.env || true
   artifacts:
     when: always
-    expire_in: 90 days
-    paths:
-      - deployment-status.env
+    paths: [deployment-status.env]
 
-deploy-runtime-base-config:
+rollback_production:
   stage: deploy
-  tags:
-    - production
-  resource_group: ml-inference-production
-  environment:
-    name: production
-  variables:
-    GIT_STRATEGY: fetch
+  tags: [production-shell]
+  resource_group: ml-inference-service-production
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - projects/model-runtime-base/base.env
-  when: manual
-  allow_failure: false
-  manual_confirmation: "Install the pinned model-runtime base manifest on production?"
-  before_script:
-    - test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA"
-    - test -f projects/model-runtime-base/base.env
-    - test -x /usr/local/sbin/ml-inference-deploy
-  script:
-    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy runtime-base --source "$CI_PROJECT_DIR" --release "$CI_COMMIT_SHA"
-
-rollback-production:
-  stage: deploy
-  tags:
-    - production
-  resource_group: ml-inference-production
-  environment:
-    name: production
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - release.env
-  when: manual
-  allow_failure: false
-  manual_confirmation: "Restore the previous inference release? Database migrations are not rolled back."
+      when: manual
   script:
     - sudo --non-interactive /usr/local/sbin/ml-inference-deploy rollback
+  environment:
+    name: production

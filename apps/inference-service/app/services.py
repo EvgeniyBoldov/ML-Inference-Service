@@ -168,6 +168,7 @@ class DeploymentManager:
                     f"expire_{previous.id if previous else previous_fleet.id}",
                 )
         except ServiceError as exc:
+            self._logger.exception("deployment_failed", extra={"deployment_id": deployment.id, "model": deployment.model, "code": exc.code})
             await self._stop_failed_candidate(runtime)
             deployment.status = DeploymentStatus.FAILED
             deployment.failed_at = int(time())
@@ -178,6 +179,7 @@ class DeploymentManager:
             self._metrics.deployment_failures.labels(deployment.model, deployment.version, exc.code).inc()
             self._metrics.runtime_status.labels(deployment.model, deployment.version, "failed").set(1)
         except Exception as exc:  # external runtime exceptions must not escape a background task
+            self._logger.exception("deployment_failed", extra={"deployment_id": deployment.id, "model": deployment.model, "code": "MODEL_LOAD_FAILED"})
             await self._stop_failed_candidate(runtime)
             deployment.status = DeploymentStatus.FAILED
             deployment.failed_at = int(time())

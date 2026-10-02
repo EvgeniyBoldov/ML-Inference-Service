@@ -136,8 +136,8 @@ v18 останется standby до истечения rollback TTL. Если л
 immutable runtime base image. Если deployment завершился `MODEL_LOAD_FAILED` и
 причина — отсутствующая или несовместимая библиотека, ML-инженер указывает точные
 пакеты и версии DevOps. DevOps добавляет их в
-`projects/model-runtime-base/requirements.txt`, выпускает base image и фиксирует
-его digest в `base.env`.
+`projects/model-runtime-base/requirements.txt`, выпускает и разворачивает полный service release с новым base и фиксирует
+его версию и digest в `release.env`.
 
 После этого Airflow повторно запускает deployment одной из active-моделей с
 **новым** `Idempotency-Key`. Это создаёт новый GREEN fleet из нового image и

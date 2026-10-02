@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ class MlflowModelSource:
         except ServiceError:
             raise
         except Exception as exc:
+            logging.getLogger("ml_inference").exception(
+                "mlflow_model_resolution_failed", extra={"model": model},
+            )
             raise ServiceError("MLFLOW_UNAVAILABLE", "Unable to retrieve model metadata from MLflow", status_code=503, error_type="server_error") from exc
 
     def _resolve_sync(self, model: str, uri: str) -> ModelMetadata:

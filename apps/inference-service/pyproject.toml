@@ -8,18 +8,10 @@ version = "0.1.0"
 description = "OpenAI-style MLflow-backed inference service"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-  "fastapi>=0.116,<1",
-  "jsonschema>=4.23,<5",
-  "pydantic>=2.8,<3",
-  "prometheus-client>=0.20,<1",
-  "sqlalchemy[asyncio]>=2.0,<3",
-  "uvicorn[standard]>=0.30,<1",
-]
+# Production dependencies live in projects/model-runtime-base/requirements.txt.
+# This file provides package metadata and local test tooling only.
 
 [project.optional-dependencies]
-mlflow = ["mlflow>=2.12,<4"]
-postgres = ["alembic>=1.13,<2", "asyncpg>=0.29,<1"]
 test = ["httpx>=0.27,<1", "pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
 
 [tool.hatch.build.targets.wheel]

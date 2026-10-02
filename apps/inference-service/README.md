@@ -52,6 +52,18 @@ records. Production applies the Alembic migration before application startup.
 
 ## Tooling
 
-`pyproject.toml` defines FastAPI, Pydantic, JSON Schema validation, Uvicorn, and
-test dependencies. Add SQLAlchemy/Alembic, MLflow, structured logging, Prometheus,
-linting, and typing tools with the corresponding implementation stages.
+`projects/model-runtime-base/requirements.txt` defines production dependencies.
+The API and model runtime inherit the same dependency base; `make release` rebuilds
+that base only when its Dockerfile or requirements change. `pyproject.toml` contains
+package metadata and local test tooling.
+
+For local application tests, install the shared dependencies and test tooling:
+
+```bash
+pip install -r projects/model-runtime-base/requirements.txt 'apps/inference-service[test]'
+make test
+```
+
+`make test-delivery` runs deployment regressions with simulated Docker and a local
+Git remote; it requires only Bash, Git and Python 3.10+ and also checks exception logs
+and release runtime manifests.

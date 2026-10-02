@@ -161,9 +161,9 @@ class DockerFleetRuntimeBackend:
             if "=" in line and not line.lstrip().startswith("#"):
                 key, value = line.split("=", 1)
                 values[key] = value
-        image = values.get("RUNTIME_BASE_IMAGE")
+        image = values.get("RUNTIME_IMAGE") or values.get("RUNTIME_BASE_IMAGE")
         if not image or "@sha256:" not in image:
-            raise RuntimeError("runtime base manifest must contain pinned RUNTIME_BASE_IMAGE")
+            raise RuntimeError("runtime manifest must contain a pinned RUNTIME_IMAGE")
         return image
 
     def _container_path(self, artifact: Path) -> str:

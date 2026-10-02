@@ -31,11 +31,13 @@ services:
       RELEASE_VERSION: "${RELEASE_VERSION}"
       RELEASE_COMMIT: "${RELEASE_COMMIT}"
       INFERENCE_TOKEN_FILE: /etc/ml-inference-service/tokens
+      MODEL_RUNTIME_BASE_FILE: /srv/release/runtime.env
     # Docker socket access is root-equivalent. This container is intentionally
     # root because it creates isolated fleet runtime containers.
     user: "0:0"
     volumes:
       - /etc/ml-inference-service:/etc/ml-inference-service:ro
+      - ${MODEL_RUNTIME_MANIFEST_FILE:?MODEL_RUNTIME_MANIFEST_FILE is required}:/srv/release/runtime.env:ro
       - /var/lib/ml-inference-service/model-artifacts:/var/lib/ml-inference-service/model-artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     networks:

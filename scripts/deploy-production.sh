@@ -5,4 +5,4 @@
 set -Eeuo pipefail
 controller="/usr/local/sbin/ml-inference-deploy"
 test -x "$controller" || { echo "Missing production controller: $controller" >&2; exit 1; }
-exec "$controller" deploy --source "${CI_PROJECT_DIR:-$(pwd)}" --release "$(git rev-parse HEAD)"
+exec sudo --non-interactive "$controller" deploy --source "${CI_PROJECT_DIR:-$(pwd)}" --release "$(git rev-parse HEAD)"

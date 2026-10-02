@@ -1,29 +1,17 @@
 stages:
   - test
-  - runtime_config
   - deploy
 
 test_service:
   stage: test
-  image: python:3.12-slim
+  tags: [production-shell]
   script:
-    - pip install 'apps/inference-service[test,postgres]'
-    - cd apps/inference-service && pytest -q
-    - cd ../../packages/ml-inference-contracts && pip install '.[mlflow]' && pytest -q
+    - bash -n scripts/release.sh scripts/release-common.sh scripts/deploy.sh scripts/production-controller.sh
+    - bash -c 'source scripts/release-common.sh; load_release_file release.env'
+    - python3 -m unittest discover -s scripts/tests -q
+    - PYTHONPATH=apps/inference-service python3 -m unittest discover -s apps/inference-service/tests -p test_delivery_logging.py -q
   rules:
     - if: '$CI_COMMIT_BRANCH'
-
-deploy_runtime_base_config:
-  stage: runtime_config
-  tags:
-    - production-shell
-  resource_group: ml-inference-service-production
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - projects/model-runtime-base/**
-  script:
-    - bash scripts/deploy-runtime-base-config.sh
 
 deploy_production:
   stage: deploy
@@ -37,9 +25,29 @@ deploy_production:
         - release.env
         - infra/compose/inference-service.compose.yaml
         - scripts/deploy-production.sh
+        - scripts/release-common.sh
+        - scripts/deploy.sh
+        - scripts/production-controller.sh
   script:
     - test -f release.env
     - test -f infra/compose/inference-service.compose.yaml
     - bash scripts/deploy-production.sh
+  environment:
+    name: production
+  after_script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy status > deployment-status.env || true
+  artifacts:
+    when: always
+    paths: [deployment-status.env]
+
+rollback_production:
+  stage: deploy
+  tags: [production-shell]
+  resource_group: ml-inference-service-production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  script:
+    - sudo --non-interactive /usr/local/sbin/ml-inference-deploy rollback
   environment:
     name: production

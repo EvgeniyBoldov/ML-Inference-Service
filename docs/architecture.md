@@ -76,7 +76,7 @@ class RuntimeBackend(Protocol):
 ```
 
 Production backend `DockerFleetRuntimeBackend` starts one Docker container per
-BLUE/GREEN fleet from the digest in `/etc/ml-inference-service/runtime-base.env`.
+BLUE/GREEN fleet from the pinned runtime digest in the current release bundle’s `runtime-base.env`.
 Artifacts are first downloaded through MLflow into a shared host cache and are
 mounted read-only into fleet containers. Пакеты в production не устанавливаются:
 изменение зависимостей требует выпуска нового base image. Изоляция сохраняется

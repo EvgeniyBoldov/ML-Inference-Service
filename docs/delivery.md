@@ -1,119 +1,95 @@
-# Release and production delivery
+# Release and delivery
 
-## Topology
+DevOps builds on a workstation with registry/PyPI access. Production only pulls
+published images. GitLab's shell runner invokes the root-owned controller using
+restricted passwordless sudo; it does not receive Docker socket access.
 
-```text
-DevOps workstation ─ make release ─> production registry
-       │                                     │
-       └─ commit/push release.env ─> GitLab pipeline / shell runner
-                                                  │
-                                                  ▼
-                                  /opt/ml-inference-service/releases/<version>
-                                                  │
-                                      direct healthcheck of inactive slot
-                                                  │
-                                                  ▼
-                         host Nginx → 127.0.0.1:18001 (blue) or :18002 (green)
+## One release workflow
+
+```bash
+# Commit source/dependency changes first; use the production default branch.
+make release-preview
+make release
 ```
 
-The GitLab runner must run on the production VM without Docker access. It may
-invoke only the root-owned `/usr/local/sbin/ml-inference-deploy` controller
-through passwordless, tightly-scoped `sudo`.
+`make release` requires a clean committed worktree and a configured remote upstream.
+It verifies that the local branch contains upstream, then:
 
-The controller reads root-owned `/etc/ml-inference-service/controller.env`:
+1. Calculates SHA256 from `projects/model-runtime-base/Dockerfile` and requirements.
+2. Reuses the pinned base when the hash matches; otherwise bumps its version,
+   builds and pushes a new dependency base.
+3. Builds API and model-runtime images from the same base; code changes rebuild
+   these images without rebuilding dependencies.
+4. Checks API imports, reads the single Alembic head and pushes release images.
+5. Verifies that local source and upstream did not change during the build.
+6. Writes `release.env`, commits it and pushes source/release commits to upstream.
 
-```dotenv
-APP_ROOT=/opt/ml-inference-service
-ETC_ROOT=/etc/ml-inference-service
-CI_BUILDS_ROOT=/builds
-```
+The manifest records `RELEASE_VERSION`, `RELEASE_COMMIT`, registry/image name,
+`BASE_VERSION`, `BASE_INPUT_SHA256`, pinned `BASE_IMAGE` and `RUNTIME_IMAGE`,
+`DB_REVISION`, and blue/green ports. It contains no credentials.
 
-Install `scripts/production-controller.sh` as `root:root`, mode `0750`, and
-allow the runner to execute only
-`ml-inference-deploy deploy|rollback|status|runtime-base`.
-The controller stages only the compose file, release manifest and deploy
-helpers into `/opt/ml-inference-service/releases/<commit-sha>`.
+A failed build or image push leaves the manifest and Git history unchanged.
+If the final Git push fails, retry `git push`; published images and the release
+commit already exist. Published version tags are never overwritten.
 
-## Release manifest
-
-`release.env` is versioned in Git and has no secret values. It contains the
-registry address, image name, two host ports, release version, and the exact
-source commit that formed the image. Runtime credentials/configuration are only
-in `/etc/ml-inference-service/runtime.env` and must never be committed.
-
-`make release-preview` displays the committed/current manifest and the manifest
-that a release would create. It compares source changes with `RELEASE_COMMIT`
-while deliberately excluding `release.env`: the subsequent manifest-only Git
-commit must not trigger a duplicate release.
-
-`make release` requires a clean, committed source tree, increments the patch
-version, records `HEAD` in `RELEASE_COMMIT`, builds the image, and pushes tags by
-version and source commit. It changes `release.env` but does not commit or push
-it. DevOps reviews, commits, and pushes it explicitly.
-
-The GitLab deployment job runs on the default branch only when the release
-manifest or deployment assets change. Ordinary source commits therefore do not
-redeploy a stale image; the manifest commit produced after `make release` is the
-deployment trigger.
-
-To request major/minor, edit `RELEASE_VERSION` to an `X.Y.0` base. The next
-`make release` emits `X.Y.1`, even if application sources are unchanged.
+The source comparison excludes the manifest-only commit so it does not create
+an unnecessary next release. To request a new major/minor, commit an `X.Y.0`
+release-version base first; the next release is `X.Y.1`.
 
 ## Production bootstrap
 
-Before the first deployment, provision:
+Install Docker Engine/Compose, Nginx and the shell runner tagged `production-shell`.
+Create external Docker network `ml-inference-runtime`, the artifact cache and
+`/etc/ml-inference-service/runtime.env` containing PostgreSQL, MLflow and artifact
+storage settings. The cache must be writable by the API and readable by the runtime.
 
-- `/etc/ml-inference-service/runtime.env` with MLflow, PostgreSQL, and service secrets; set
-  `INFERENCE_DATABASE_URL=postgresql+asyncpg://ml_inference:<password>@postgres:5432/ml_inference`
-  plus `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `MLFLOW_TRACKING_URI`
-  there. The deployment job starts PostgreSQL from the common Compose file before
-  applying migrations.
-- `/etc/ml-inference-service/tokens`, created with
-  `scripts/manage-inference-token.sh`; it is mounted read-only into the service.
-- `/etc/ml-inference-service/runtime-base.env`, copied by the runtime-base
-  GitLab job from `projects/model-runtime-base/base.env` and containing a pinned
-  `RUNTIME_BASE_IMAGE` digest.
-- `/var/lib/ml-inference-service/model-artifacts`, writable by the service and
-  shared read-only with fleet runtime containers.
-- `/etc/nginx/conf.d/ml-inference-service.conf` from
-  `infra/nginx/ml-inference-service.conf`.
-- `/etc/nginx/conf.d/ml-inference-service-upstream.conf` from the included
-  example, then validate/reload Nginx.
-- Docker and Compose plugin; registry access is unauthenticated by current
-  infrastructure decision.
+Install `scripts/production-controller.sh` root-owned at
+`/usr/local/sbin/ml-inference-deploy`, mode 0750. Its
+`/etc/ml-inference-service/controller.env` must be root:root 0600 and configure
+`CI_BUILDS_ROOT`, optionally `APP_ROOT` and `ETC_ROOT`. Permit the runner only the
+controller's `deploy`, `rollback`, and `status` operations through sudo.
 
-The versioned manifests in a fresh repository intentionally contain no release
-commit/base digest. They are not deployable initial configuration: first publish
-the application with `make release`, publish the runtime base with
-`make runtime-base-release`, review the resulting manifests, and commit them
-before enabling either production job.
+When upgrading an existing installation to this release workflow, reinstall the
+controller once with the updated script:
 
-The deployment job executes `alembic upgrade head` using the candidate image
-before it starts the candidate service. The database URL is read only from the
-host-owned runtime environment file.
-
-For fleet model runtime, add the following values to `runtime.env`:
-
-```dotenv
-MODEL_ARTIFACT_CACHE_ROOT=/var/lib/ml-inference-service/model-artifacts
-MODEL_RUNTIME_BASE_FILE=/etc/ml-inference-service/runtime-base.env
-MODEL_FLEET_MEMORY_LIMIT=24g
-MODEL_FLEET_CPU_LIMIT=8
+```bash
+sudo install -o root -g root -m 0750 scripts/production-controller.sh /usr/local/sbin/ml-inference-deploy
 ```
 
-Limits are environment-specific examples. A blue/green fleet rollout loads both
-the old and new complete model sets, so the VM must have headroom for roughly two
-loaded fleets.
+Configure registry/image names in `release.env`, commit sources and publish the
+first release before deployment. Initial empty hashes/digests are bootstrap values
+and cannot be deployed.
 
-## Blue/green and rollback
+## CI and blue/green
 
-The deploy job starts the new immutable release in the inactive port slot and
-healthchecks it directly. Only on success does it replace Nginx's upstream file
-and reload Nginx. The former active slot remains running as one-release standby.
-The state file separately records active and standby projects; the next deployment
-reclaims only that inactive standby slot, never the active one, before starting a
-candidate.
+The default-branch release-manifest commit triggers `deploy_production` after tests.
+The controller stages compose, deploy helpers, manifest and a derived
+`runtime-base.env` under `/opt/ml-inference-service/releases/<RELEASE_VERSION>/`.
+The directory's release marker records the exact CI commit; a different commit
+cannot reuse that version directory.
 
-To roll back, use the manual `rollback-production` job from the supplied
-`gitlab-ci.example.yml`. It promotes the healthy standby release and swaps the
-Nginx upstream atomically. Database migrations remain forward-only.
+PostgreSQL runs under the stable `ml-inference-postgres` project. For the new API
+slot the controller pulls published API/runtime images, verifies image labels
+against the manifest, checks the Alembic head, and applies `DB_REVISION`. It starts
+the candidate on the inactive loopback port and waits for `/health/ready`.
+
+After readiness it switches Nginx, records active/standby state and **stops the
+previous API container**. Its release bundle/container is retained for rollback.
+A failed candidate is stopped and the active API/upstream remain unchanged. Nginx
+validation/reload failures restore the previous configuration file. Repeating an
+already active deployment does not restart it or switch to the other slot.
+
+The release-local runtime manifest is mounted read-only into API at
+`/srv/release/runtime.env`; compose overrides `MODEL_RUNTIME_BASE_FILE`. Global
+`/etc/ml-inference-service/runtime-base.env` is no longer used by new releases.
+
+The manual `rollback_production` job starts the retained previous API, checks its
+readiness, switches upstream, then stops the replaced API. Database migrations
+are not rolled back; schema changes must remain compatible with the retained API.
+
+## New model dependencies
+
+Add libraries to the shared requirements and publish/deploy a service release
+before deploying a model needing them. Model deployments use the current release's
+runtime image and never install libraries dynamically. Existing active fleets
+keep their saved digest until a new model deployment creates a replacement fleet.

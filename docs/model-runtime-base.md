@@ -1,41 +1,49 @@
-# Базовый образ model runtime
+# Общий base образ
 
-`projects/model-runtime-base` — независимый subproject с общим immutable image
-для всего набора ML-моделей. В production этот image не устанавливает пакеты и
-не требует доступа в интернет.
+`projects/model-runtime-base/requirements.txt` — единый список production-библиотек
+API и всех ML-моделей. `Dockerfile` устанавливает их в общий dependency base.
+Production-контейнеры наследуют этот образ и не устанавливают пакеты при запуске.
+`pyproject.toml` API содержит только метаданные Python-пакета и настройки тестов.
 
-## Содержимое
+## Состав релиза
 
-- `requirements.txt` — общий совместимый набор библиотек всех моделей;
-- `Dockerfile` — сборка base image;
-- `runner.py` — generic HTTP runtime, который загружает полный model fleet из
-  read-only manifest и artifact cache;
-- `base.env` — версия, хеш входных файлов и pinned image digest.
+- dependency base: Dockerfile и requirements;
+- API image: общий base плюс `apps/inference-service/app` и миграции;
+- model runtime image: тот же base плюс `runner.py` из `Dockerfile.runtime`.
+
+`make release` сравнивает хеш **только Dockerfile base и requirements.txt** с
+`BASE_INPUT_SHA256` в `release.env`. При изменении этих файлов повышается
+`BASE_VERSION` и публикуется новый base. Изменения API, миграций или runner не
+пересобирают base: кодовые образы API и model runtime собираются для нового релиза.
 
 ## Выпуск
 
-На ноутбуке DevOps с интернетом:
+На рабочей станции DevOps с доступом к registry и production GitLab:
 
 ```bash
-make runtime-base-preview
-make runtime-base-release
+git add projects/model-runtime-base/requirements.txt
+git commit -m "Add model dependencies"
+make release-preview
+make release
 ```
 
-Вторая команда повышает patch-версию при изменении Dockerfile, requirements или
-runner, собирает и пушит image, затем записывает его digest в `base.env`.
-Изменённый `base.env` нужно проверить, закоммитить и отправить в GitLab.
+Последняя команда строит и пушит образы, записывает версии и digest в `release.env`,
+коммитит manifest и пушит текущую ветку в её upstream. Изменённый manifest запускает
+GitLab deployment. `make runtime-base-preview` и `make runtime-base-release` —
+совместимые aliases единого процесса; отдельного `base.env` больше нет.
 
-Изменения `projects/model-runtime-base/**` намеренно исключены из
-`make release-preview` основного Inference Service. У base image свой lifecycle.
-GitLab job копирует актуальный manifest на production VM в
-`/etc/ml-inference-service/runtime-base.env`.
+## Использование на production
 
-## Fleet rollout
+Controller создаёт release bundle в `/opt/ml-inference-service/releases/<версия>/`.
+Его `runtime-base.env` содержит `RUNTIME_IMAGE` из `release.env` и монтируется в API
+как `/srv/release/runtime.env`. Каждая версия API использует свой pinned runtime.
 
-Новый deployment создаёт GREEN container из digest, указанного в manifest. В
-него монтируется полный набор artifact моделей. Runtime загружает и smoke-тестит
-все модели, включая уже существующие. Только после этого сервис атомарно меняет
-active fleet на GREEN. BLUE fleet остаётся для rollback TTL.
+Новая модель загружается в model runtime текущего релиза. Если библиотека отсутствует,
+загрузка завершается ошибкой и текущий fleet продолжает работать. Добавьте библиотеку
+в requirements, выполните полный release и production deployment, затем повторите
+model deployment с новым `Idempotency-Key`. Пакеты из требований самой MLflow-модели
+автоматически не устанавливаются.
 
-Если новая base image не совместима хотя бы с одной legacy-моделью, переключения
-не будет: Airflow увидит failed deployment, а BLUE fleet останется рабочим.
+Активный fleet сохраняет записанный при загрузке digest. Новый model deployment
+строит fleet из runtime текущего релиза и проверяет все включённые модели перед
+переключением; предыдущий fleet остаётся на rollback TTL.
