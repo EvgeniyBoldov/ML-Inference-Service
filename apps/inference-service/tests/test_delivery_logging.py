@@ -30,3 +30,15 @@ class DeliveryLoggingTests(unittest.TestCase):
             manifest.write_text("RUNTIME_IMAGE=registry.test/service-runtime:latest\n")
             with self.assertRaisesRegex(RuntimeError, "pinned"):
                 runtime._read_image()
+
+    def test_model_runtime_reads_full_release_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "release.env"
+            image = "registry.test/service-runtime@sha256:" + "b" * 64
+            manifest.write_text(
+                "# Immutable release state\nRELEASE_VERSION=0.1.3\n"
+                "BASE_IMAGE=registry.test/service-base@sha256:" + "a" * 64 + "\n"
+                f"RUNTIME_IMAGE={image}\nDB_REVISION=0002\n"
+            )
+            runtime = DockerFleetRuntimeBackend(image_manifest=str(manifest), artifact_cache_root=tmp)
+            self.assertEqual(runtime._read_image(), image)

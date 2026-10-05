@@ -18,10 +18,18 @@ stage() {
   runtime_image="$(sed -n 's/^RUNTIME_IMAGE=//p' "$source/release.env")"
   [[ "$runtime_image" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "Release RUNTIME_IMAGE must be pinned by digest"
   dest="${APP_ROOT}/releases/${version}"
-  if [[ -e "$dest" ]]; then [[ -f "$dest/.release-id" && "$(<"$dest/.release-id")" == "$id" ]] || fail "Invalid existing release: $dest"; echo "$dest"; return; fi
+  if [[ -e "$dest" ]]; then
+    [[ -f "$dest/.release-id" && "$(<"$dest/.release-id")" == "$id" ]] || fail "Invalid existing release: $dest"
+    for file in release.env compose.yaml scripts/release-common.sh scripts/deploy.sh; do
+      [[ -f "$dest/$file" && -r "$dest/$file" ]] || fail "Existing release bundle is incomplete: $dest/$file"
+    done
+    cmp -s "$source/release.env" "$dest/release.env" || fail "Existing release manifest differs from CI source: $dest/release.env"
+    echo "$dest"
+    return
+  fi
   for file in release.env infra/compose/inference-service.compose.yaml scripts/release-common.sh scripts/deploy.sh; do [[ -f "$source/$file" ]] || fail "Release bundle is missing $file"; done
   tmp="$(mktemp -d "${APP_ROOT}/releases/.${id}.XXXXXX")"; trap 'rm -rf "${tmp:-}"' RETURN
-  install -D -o root -m 0640 "$source/release.env" "$tmp/release.env"; install -D -o root -m 0640 "$source/infra/compose/inference-service.compose.yaml" "$tmp/compose.yaml"; install -D -o root -m 0640 "$source/scripts/release-common.sh" "$tmp/scripts/release-common.sh"; install -D -o root -m 0750 "$source/scripts/deploy.sh" "$tmp/scripts/deploy.sh"; printf 'RUNTIME_IMAGE=%s\n' "$runtime_image" > "$tmp/runtime-base.env"; chmod 0644 "$tmp/runtime-base.env"; printf '%s\n' "$id" > "$tmp/.release-id"; chmod 0640 "$tmp/.release-id"; chmod 0750 "$tmp" "$tmp/scripts"; mv "$tmp" "$dest"; trap - RETURN; echo "$dest"
+  install -D -o root -m 0640 "$source/release.env" "$tmp/release.env"; install -D -o root -m 0640 "$source/infra/compose/inference-service.compose.yaml" "$tmp/compose.yaml"; install -D -o root -m 0640 "$source/scripts/release-common.sh" "$tmp/scripts/release-common.sh"; install -D -o root -m 0750 "$source/scripts/deploy.sh" "$tmp/scripts/deploy.sh"; printf '%s\n' "$id" > "$tmp/.release-id"; chmod 0640 "$tmp/.release-id"; chmod 0750 "$tmp" "$tmp/scripts"; mv "$tmp" "$dest"; trap - RETURN; echo "$dest"
 }
 
 command="${1:-}"; shift || true; mkdir -p "$APP_ROOT/releases"

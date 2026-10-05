@@ -35,7 +35,7 @@ GitLab deployment. `make runtime-base-preview` и `make runtime-base-release` �
 ## Использование на production
 
 Controller создаёт release bundle в `/opt/ml-inference-service/releases/<версия>/`.
-Его `runtime-base.env` содержит `RUNTIME_IMAGE` из `release.env` и монтируется в API
+Его `release.env` содержит `RUNTIME_IMAGE` и монтируется в API
 как `/srv/release/runtime.env`. Каждая версия API использует свой pinned runtime.
 
 Новая модель загружается в model runtime текущего релиза. Если библиотека отсутствует,

@@ -154,6 +154,38 @@ if args[0] == "run" and args[-1] == "heads":
 
 
 class DeployTests(unittest.TestCase):
+    def test_compose_mounts_release_manifest_despite_old_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "release.env").write_text("RUNTIME_IMAGE=registry.test/runtime@sha256:" + "a" * 64 + "\n")
+            (root / "runtime-base.env").mkdir()
+            script = r'''
+source "$DEPLOY_SCRIPT"
+RELEASE_DIR="$FIXTURE"; COMPOSE_PROJECT=test
+docker() { printf '%s\n' "$MODEL_RUNTIME_MANIFEST_FILE"; }
+compose up -d inference-service
+'''
+            result = run(["bash", "-c", script], env=dict(os.environ, DEPLOY_SCRIPT=str(ROOT / "scripts/deploy.sh"), FIXTURE=tmp))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout.strip(), str(root / "release.env"))
+
+    def test_compose_rejects_missing_or_directory_manifest_before_docker(self):
+        for directory in (False, True):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                if directory:
+                    (root / "release.env").mkdir()
+                script = r'''
+source "$DEPLOY_SCRIPT"
+RELEASE_DIR="$FIXTURE"; COMPOSE_PROJECT=test
+docker() { touch "$FIXTURE/docker-called"; }
+compose up -d inference-service
+'''
+                result = run(["bash", "-c", script], env=dict(os.environ, DEPLOY_SCRIPT=str(ROOT / "scripts/deploy.sh"), FIXTURE=tmp))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Release manifest must be a readable file", result.stdout)
+                self.assertFalse((root / "docker-called").exists())
+
     def test_actual_nginx_validation_failure_restores_previous_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             upstream = Path(tmp) / "upstream.conf"

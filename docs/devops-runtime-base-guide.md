@@ -37,5 +37,5 @@ commit и хеш base в labels образов. Controller фиксирует ru
 
 ```bash
 sudo /usr/local/sbin/ml-inference-deploy status
-sudo cat /opt/ml-inference-service/current/runtime-base.env
+sudo cat /opt/ml-inference-service/current/release.env
 ```

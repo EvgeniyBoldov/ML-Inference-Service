@@ -22,7 +22,11 @@ EOF
 }
 require_root() { test "$EUID" -eq 0 || fail "deploy.sh must run through the root-owned controller."; }
 current_value() { local key="$1"; [[ -f "$STATE_FILE" ]] && sed -n "s/^${key}=//p" "$STATE_FILE" | tail -n 1 || true; }
-compose() { INFERENCE_RUNTIME_ENV_FILE="$RUNTIME_ENV" MODEL_RUNTIME_MANIFEST_FILE="$RELEASE_DIR/runtime-base.env" SLOT_PORT="${SLOT_PORT:-1}" docker compose --project-name "$COMPOSE_PROJECT" --env-file "$RUNTIME_ENV" --env-file "$RELEASE_DIR/release.env" -f "$RELEASE_DIR/compose.yaml" "$@"; }
+compose() {
+  # The validated release manifest is also the runtime image manifest.
+  test -f "$RELEASE_DIR/release.env" && test -r "$RELEASE_DIR/release.env" || fail "Release manifest must be a readable file: $RELEASE_DIR/release.env"
+  INFERENCE_RUNTIME_ENV_FILE="$RUNTIME_ENV" MODEL_RUNTIME_MANIFEST_FILE="$RELEASE_DIR/release.env" SLOT_PORT="${SLOT_PORT:-1}" docker compose --project-name "$COMPOSE_PROJECT" --env-file "$RUNTIME_ENV" --env-file "$RELEASE_DIR/release.env" -f "$RELEASE_DIR/compose.yaml" "$@"
+}
 validate_runtime() {
   require_command docker; require_command curl; require_command flock; require_command nginx; require_command systemctl
   test -r "$RUNTIME_ENV" || fail "Runtime environment is missing: $RUNTIME_ENV"
@@ -140,6 +144,6 @@ main() {
   local command="${1:-}"; shift || true; require_root
   case "$command" in deploy|validate) [[ "${1:-}" == --release-dir && -n "${2:-}" ]] || usage; RELEASE_DIR="$2"; [[ "$command" == validate ]] && { validate_runtime; load_bundle "$RELEASE_DIR"; return; } ;; rollback|status) test "$#" -eq 0 || usage ;; *) usage ;; esac
   validate_runtime; exec 9>"${ETC_ROOT}/deploy.lock"; flock -n 9 || fail "Another deployment is already running."
-  case "$command" in deploy) start_postgres "$RELEASE_DIR"; deploy ;; rollback) rollback ;; status) status ;; esac
+  case "$command" in deploy) load_bundle "$RELEASE_DIR"; start_postgres "$RELEASE_DIR"; deploy ;; rollback) rollback ;; status) status ;; esac
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

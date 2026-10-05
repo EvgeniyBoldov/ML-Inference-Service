@@ -63,8 +63,8 @@ and cannot be deployed.
 ## CI and blue/green
 
 The default-branch release-manifest commit triggers `deploy_production` after tests.
-The controller stages compose, deploy helpers, manifest and a derived
-`runtime-base.env` under `/opt/ml-inference-service/releases/<RELEASE_VERSION>/`.
+The controller stages compose, deploy helpers and `release.env` under
+`/opt/ml-inference-service/releases/<RELEASE_VERSION>/`.
 The directory's release marker records the exact CI commit; a different commit
 cannot reuse that version directory.
 
@@ -79,9 +79,10 @@ A failed candidate is stopped and the active API/upstream remain unchanged. Ngin
 validation/reload failures restore the previous configuration file. Repeating an
 already active deployment does not restart it or switch to the other slot.
 
-The release-local runtime manifest is mounted read-only into API at
-`/srv/release/runtime.env`; compose overrides `MODEL_RUNTIME_BASE_FILE`. Global
-`/etc/ml-inference-service/runtime-base.env` is no longer used by new releases.
+The validated release-local `release.env` is mounted read-only into API at
+`/srv/release/runtime.env`; compose overrides `MODEL_RUNTIME_BASE_FILE`.
+The bind mount disables automatic host path creation: a missing manifest fails
+deployment instead of becoming a directory. No separate `runtime-base.env` is needed.
 
 The manual `rollback_production` job starts the retained previous API, checks its
 readiness, switches upstream, then stops the replaced API. Database migrations
