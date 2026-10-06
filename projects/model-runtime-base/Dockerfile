@@ -16,5 +16,5 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import boto3; import mlflow; import asyncpg; import alembic"
 
-RUN useradd --create-home --uid 10001 runtime
+RUN groupadd --gid 10001 runtime && useradd --create-home --uid 10001 --gid 10001 runtime
 USER runtime

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -121,9 +123,12 @@ class DockerFleetRuntimeBackend:
             {"name": model.name, "path": self._container_path(Path(model.artifact_path or ""))}
             for model in runtime.models.values()
         ]}), encoding="utf-8")
+        self._prepare_runtime_read_access(manifest_path)
+        for model in runtime.models.values():
+            self._prepare_runtime_read_access(Path(model.artifact_path or ""))
         if (await self._docker("network", "inspect", self._network, check=False))[0] != 0:
             await self._docker("network", "create", self._network)
-        args = ["run", "-d", "--rm", "--name", name, "--network", self._network,
+        args = ["run", "-d", "--name", name, "--network", self._network,
                 "--label", "ml-inference-service.runtime=fleet", "--label", f"ml-inference-service.fleet-id={runtime.id}"]
         if self._memory_limit:
             args.extend(["--memory", self._memory_limit])
@@ -138,6 +143,14 @@ class DockerFleetRuntimeBackend:
         while asyncio.get_running_loop().time() < deadline:
             if await self.health(runtime):
                 return
+            state_status, state = await self._docker(
+                "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name, check=False,
+            )
+            if state_status == 0 and state.split(maxsplit=1)[0] != "running":
+                _, logs = await self._docker("logs", "--tail", "200", name, check=False)
+                exit_code = state.split(maxsplit=1)[1] if len(state.split(maxsplit=1)) > 1 else "unknown"
+                await self.stop(runtime)
+                raise RuntimeError(f"Fleet runtime exited during startup (exit={exit_code}): {logs}")
             await asyncio.sleep(2)
         await self.stop(runtime)
         raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Fleet runtime did not become healthy", status_code=502)
@@ -179,6 +192,33 @@ class DockerFleetRuntimeBackend:
         if check and process.returncode:
             raise RuntimeError(f"Docker runtime command failed: {output}")
         return process.returncode or 0, output
+
+    def _prepare_runtime_read_access(self, path: Path) -> None:
+        """Grant only the runtime group read/traverse access to cached model files."""
+        runtime_gid = 10001
+        resolved = path.resolve()
+        resolved.relative_to(self._cache_root)
+        directories = [*resolved.parents]
+        if resolved.is_dir():
+            directories.append(resolved)
+        directories = [item for item in directories if item == self._cache_root or self._cache_root in item.parents]
+        for directory in reversed(directories):
+            if directory.is_symlink():
+                continue
+            os.chown(directory, -1, runtime_gid)
+            os.chmod(directory, stat.S_IMODE(directory.stat().st_mode) | stat.S_IRGRP | stat.S_IXGRP)
+        if resolved.is_dir():
+            for entry in resolved.rglob("*"):
+                if entry.is_symlink():
+                    continue
+                os.chown(entry, -1, runtime_gid)
+                permissions = stat.S_IMODE(entry.stat().st_mode) | stat.S_IRGRP
+                if entry.is_dir():
+                    permissions |= stat.S_IXGRP
+                os.chmod(entry, permissions)
+        elif not resolved.is_symlink():
+            os.chown(resolved, -1, runtime_gid)
+            os.chmod(resolved, stat.S_IMODE(resolved.stat().st_mode) | stat.S_IRGRP)
 
     def _read_image(self) -> str:
         values = {}

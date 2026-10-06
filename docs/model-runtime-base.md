@@ -15,6 +15,10 @@ Docker CLI устанавливается в Dockerfile API и проверяе�
 `docker --version`. API управляет fleet через сокет Docker Engine production-хоста;
 общему base и контейнерам моделей Docker CLI не требуется.
 
+Fleet работает с UID/GID 10001. Перед запуском API даёт этой группе доступ на чтение
+к manifest и файлам загруженных моделей. Упавший при старте fleet сохраняется до
+считывания его логов и удаляется обработчиком неуспешного deployment.
+
 `make release` сравнивает хеш **только Dockerfile base и requirements.txt** с
 `BASE_INPUT_SHA256` в `release.env`. При изменении этих файлов повышается
 `BASE_VERSION` и публикуется новый base. Изменения API, миграций или runner не
