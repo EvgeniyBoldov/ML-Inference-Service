@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 USER root
 # The control plane uses the host Docker Engine through its mounted socket.
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y docker.io \
+    && apt-get install --no-install-recommends -y docker-cli \
     && rm -rf /var/lib/apt/lists/* \
     && docker --version
 
