@@ -9,7 +9,7 @@ from typing import Any
 
 
 class JsonFormatter(logging.Formatter):
-    _fields = ("request_id", "model", "version", "deployment_id", "runtime_id", "status", "latency_ms", "code", "method", "route", "status_code")
+    _fields = ("request_id", "model", "version", "deployment_id", "runtime_id", "status", "latency_ms", "code", "method", "route", "status_code", "stage", "attempt", "model_count", "exit_code", "elapsed_ms", "image")
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {"level": record.levelname, "event": record.getMessage(), "logger": record.name}

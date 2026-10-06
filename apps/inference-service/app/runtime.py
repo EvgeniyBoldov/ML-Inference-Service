@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import stat
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from uuid import uuid4
 
 from .domain import ModelMetadata
 from .errors import ServiceError
+
+logger = logging.getLogger("ml_inference")
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,7 @@ class DockerFleetRuntimeBackend:
         self._prepare_runtime_read_access(manifest_path)
         for model in runtime.models.values():
             self._prepare_runtime_read_access(Path(model.artifact_path or ""))
+        logger.info("fleet_manifest_prepared", extra={"runtime_id": runtime.id, "model_count": len(runtime.models), "stage": "manifest"})
         if (await self._docker("network", "inspect", self._network, check=False))[0] != 0:
             await self._docker("network", "create", self._network)
         args = ["run", "-d", "--name", name, "--network", self._network,
@@ -138,10 +142,16 @@ class DockerFleetRuntimeBackend:
         # Register before starting Docker so cancellation can clean up a container
         # created by the daemon even if the client never received its response.
         self._containers[runtime.id] = name
+        started = asyncio.get_running_loop().time()
+        logger.info("fleet_container_starting", extra={"runtime_id": runtime.id, "model_count": len(runtime.models), "stage": "container_start"})
         await self._docker(*args)
+        logger.info("fleet_container_started", extra={"runtime_id": runtime.id, "stage": "container_start"})
         deadline = asyncio.get_running_loop().time() + self._startup_timeout
+        attempt = 0
         while asyncio.get_running_loop().time() < deadline:
+            attempt += 1
             if await self.health(runtime):
+                logger.info("fleet_healthcheck_succeeded", extra={"runtime_id": runtime.id, "attempt": attempt, "elapsed_ms": int((asyncio.get_running_loop().time() - started) * 1000), "stage": "healthcheck"})
                 return
             state_status, state = await self._docker(
                 "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name, check=False,
@@ -149,8 +159,11 @@ class DockerFleetRuntimeBackend:
             if state_status == 0 and state.split(maxsplit=1)[0] != "running":
                 _, logs = await self._docker("logs", "--tail", "200", name, check=False)
                 exit_code = state.split(maxsplit=1)[1] if len(state.split(maxsplit=1)) > 1 else "unknown"
+                logger.error("fleet_container_exited", extra={"runtime_id": runtime.id, "exit_code": exit_code, "attempt": attempt, "elapsed_ms": int((asyncio.get_running_loop().time() - started) * 1000), "stage": "model_startup"})
                 await self.stop(runtime)
                 raise RuntimeError(f"Fleet runtime exited during startup (exit={exit_code}): {logs}")
+            if attempt == 1 or attempt % 15 == 0:
+                logger.info("fleet_healthcheck_pending", extra={"runtime_id": runtime.id, "attempt": attempt, "elapsed_ms": int((asyncio.get_running_loop().time() - started) * 1000), "stage": "healthcheck"})
             await asyncio.sleep(2)
         await self.stop(runtime)
         raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Fleet runtime did not become healthy", status_code=502)
