@@ -26,9 +26,9 @@ from .runtime import RuntimeBackend, RuntimeHandle
 
 @dataclass(frozen=True)
 class FleetSnapshot:
-    """A prediction-safe pairing of one runtime and its exact model routes."""
+    """A prediction-safe routing table and its producer-image runtime groups."""
 
-    runtime: RuntimeHandle
+    runtimes: dict[str, RuntimeHandle]
     deployments: dict[str, Deployment]
 
 
@@ -44,12 +44,10 @@ class DeploymentManager:
         # A fleet is a single consistency unit: concurrent Airflow deployments
         # must not build two candidates from different model sets.
         self._rollout_lock = asyncio.Lock()
-        self._active_fleet: RuntimeHandle | None = None
-        self._previous_fleet: RuntimeHandle | None = None
-        self._active_fleet_deployments: dict[str, Deployment] = {}
-        self._previous_fleet_deployments: dict[str, Deployment] = {}
         self._fleet_lock = asyncio.Lock()
         self._active_snapshot: FleetSnapshot | None = None
+        self._previous_snapshot: FleetSnapshot | None = None
+        self._runtime_handles: dict[str, RuntimeHandle] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._logger = logging.getLogger("ml_inference")
         self._inflight: dict[str, int] = {}
@@ -95,25 +93,27 @@ class DeploymentManager:
 
     async def _rollback_serialized(self, model: str, expected_deployment_id: str | None) -> Deployment:
         current = await self._repository.active_for(model)
-        previous = self._previous_fleet_deployments.get(model)
         async with self._fleet_lock:
-            previous_runtime = self._previous_fleet
-        if current is None or previous is None or previous_runtime is None:
+            previous_snapshot = self._previous_snapshot
+            current_snapshot = self._active_snapshot
+        previous = previous_snapshot.deployments.get(model) if previous_snapshot else None
+        if current is None or previous is None or previous_snapshot is None or current_snapshot is None:
             raise ServiceError("DEPLOYMENT_FAILED", "No previous fleet is available", status_code=409)
         if (expected_deployment_id and current.id != expected_deployment_id) or previous.id == current.id:
             raise ServiceError("DEPLOYMENT_FAILED", "Rollback is available only for the latest fleet transition", status_code=409)
-        if self._active_fleet_deployments.get(model) is None or self._active_fleet_deployments[model].id != current.id:
+        if current_snapshot.deployments.get(model) is None or current_snapshot.deployments[model].id != current.id:
             raise ServiceError("DEPLOYMENT_FAILED", "Active fleet does not match persisted routes", status_code=409)
-        try:
-            healthy = await asyncio.wait_for(self._runtime.health(previous_runtime), timeout=2)
-        except Exception as exc:
-            raise ServiceError("RUNTIME_UNAVAILABLE", "Previous fleet runtime is unavailable", status_code=503) from exc
-        if not healthy:
-            raise ServiceError("RUNTIME_UNAVAILABLE", "Previous fleet runtime is unhealthy", status_code=503)
         restored = {
-            name: replace(item, runtime_id=previous_runtime.id, runtime_image=previous_runtime.image, status=DeploymentStatus.ACTIVE)
-            for name, item in self._previous_fleet_deployments.items()
+            name: replace(item, status=DeploymentStatus.ACTIVE)
+            for name, item in previous_snapshot.deployments.items()
         }
+        for runtime in previous_snapshot.runtimes.values():
+            try:
+                healthy = await asyncio.wait_for(self._runtime.health(runtime), timeout=2)
+            except Exception as exc:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Previous runtime group is unavailable", status_code=503) from exc
+            if not healthy:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Previous runtime group is unhealthy", status_code=503)
         try:
             active, former_active = await self._repository.rollback(model, list(restored.values()))
         except LookupError as exc:
@@ -122,15 +122,11 @@ class DeploymentManager:
             self._reconciliation_required = True
             raise
         async with self._fleet_lock:
-            self._active_fleet, self._previous_fleet = previous_runtime, self._active_fleet
-            self._previous_fleet_deployments = dict(self._active_fleet_deployments)
-            self._active_fleet_deployments = restored
-            self._active_snapshot = FleetSnapshot(previous_runtime, dict(restored))
-            standby_fleet = self._previous_fleet
-            # Invalidate any earlier expiry timer for the runtime becoming active.
-            self._expiry_generation[previous_runtime.id] = self._expiry_generation.get(previous_runtime.id, 0) + 1
-        if standby_fleet:
-            self._schedule_expiry(standby_fleet, former_active)
+            self._active_snapshot = FleetSnapshot(dict(previous_snapshot.runtimes), restored)
+            self._previous_snapshot = current_snapshot
+            self._runtime_handles.update(previous_snapshot.runtimes)
+            self._runtime_handles.update(current_snapshot.runtimes)
+        self._schedule_snapshot_expiry(current_snapshot)
         return active
 
     async def _run(self, deployment: Deployment) -> None:
@@ -155,9 +151,13 @@ class DeploymentManager:
             current = await self._repository.list_active()
             if any(item.metadata is None for item in current):
                 raise ServiceError("RUNTIME_UNAVAILABLE", "Active fleet metadata is incomplete", status_code=503)
-            fleet_models = [item.metadata for item in current if item.metadata and item.model != deployment.model]
-            fleet_models.append(metadata)
-            runtime = await self._runtime.deploy(fleet_models)
+            if current and self._active_snapshot is None:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Active runtime groups have not been restored", status_code=503)
+            producer_image = await self._runtime.resolve_image(metadata.producer_image)
+            group = [item for item in current if item.model != deployment.model and item.runtime_image == producer_image]
+            group_models = [item.metadata for item in group if item.metadata]
+            group_models.append(metadata)
+            runtime = await self._runtime.deploy(group_models, image=producer_image)
             deployment.runtime_id = runtime.id
             deployment.runtime_image = runtime.image
             await asyncio.wait_for(self._runtime.load(runtime), timeout=240)
@@ -166,7 +166,7 @@ class DeploymentManager:
 
             deployment.status = DeploymentStatus.WARMING_UP
             await self._repository.save(deployment)
-            for fleet_model in fleet_models:
+            for fleet_model in group_models:
                 output = await asyncio.wait_for(self._runtime.predict(runtime, fleet_model.name, fleet_model.input_example), timeout=30)
                 _validate_output(fleet_model.output_schema, output)
                 json.dumps(output, allow_nan=False)
@@ -174,30 +174,30 @@ class DeploymentManager:
             await self._repository.save(deployment)
             deployment.activated_at = int(time())
             promotion_started = True
-            previous = await self._repository.activate(deployment, current)
-            # Preserve the old snapshot for rollback; do not mutate its records.
-            updated = [replace(item, runtime_id=runtime.id, runtime_image=runtime.image) for item in current]
+            previous_snapshot = self._active_snapshot or FleetSnapshot({}, {})
+            previous = await self._repository.activate(deployment, group)
+            updated = dict(previous_snapshot.deployments)
+            for item in group:
+                updated[item.model] = replace(item, runtime_id=runtime.id, runtime_image=runtime.image)
+            updated[deployment.model] = deployment
+            runtimes = dict(previous_snapshot.runtimes)
+            for runtime_id in tuple(runtimes):
+                if not any(item.runtime_id == runtime_id for item in updated.values()):
+                    runtimes.pop(runtime_id)
+            runtimes[runtime.id] = runtime
             async with self._fleet_lock:
-                previous_fleet = self._active_fleet
-                self._previous_fleet_deployments = {item.model: item for item in current}
-                self._active_fleet_deployments = {
-                    item.model: item for item in updated if item.model != deployment.model
-                }
-                self._active_fleet_deployments[deployment.model] = deployment
-                self._active_fleet = runtime
-                self._active_snapshot = FleetSnapshot(runtime, dict(self._active_fleet_deployments))
-                self._previous_fleet = previous_fleet
+                self._previous_snapshot = previous_snapshot
+                self._active_snapshot = FleetSnapshot(runtimes, updated)
+                self._runtime_handles.update(previous_snapshot.runtimes)
+                self._runtime_handles[runtime.id] = runtime
             self._metrics.deployments.labels(deployment.model, deployment.version, "active").inc()
             self._metrics.model_load_duration.labels(deployment.model, deployment.version).observe(perf_counter() - started_at)
             self._metrics.runtime_status.labels(deployment.model, deployment.version, "active").set(1)
             self._metrics.active_version.labels(deployment.model, deployment.version).set(1)
-            if previous_fleet:
-                self._schedule_expiry(previous_fleet, previous)
-                await asyncio.wait_for(self._runtime.drain(previous_fleet), timeout=30)
-                if previous:
-                    self._metrics.runtime_status.labels(previous.model, previous.version, "active").set(0)
-                    self._metrics.runtime_status.labels(previous.model, previous.version, "standby").set(1)
-                    self._metrics.active_version.labels(previous.model, previous.version).set(0)
+            if previous:
+                self._metrics.runtime_status.labels(previous.model, previous.version, "standby").set(1)
+                self._metrics.active_version.labels(previous.model, previous.version).set(0)
+            self._schedule_snapshot_expiry(previous_snapshot)
         except asyncio.CancelledError:
             if promotion_started:
                 self._reconciliation_required = True
@@ -235,7 +235,7 @@ class DeploymentManager:
         if runtime is None:
             return
         async with self._fleet_lock:
-            is_active = self._active_fleet is not None and self._active_fleet.id == runtime.id
+            is_active = bool(self._active_snapshot and runtime.id in self._active_snapshot.runtimes)
         if not is_active:
             if check_persisted:
                 try:
@@ -261,7 +261,10 @@ class DeploymentManager:
         deployment = snapshot.deployments.get(model)
         if deployment is None:
             raise ServiceError("MODEL_NOT_FOUND", f"Model '{model}' is not active", status_code=404, param="model")
-        return deployment, snapshot.runtime
+        runtime = snapshot.runtimes.get(deployment.runtime_id or "")
+        if runtime is None:
+            raise ServiceError("RUNTIME_UNAVAILABLE", "Active model runtime group is unavailable", status_code=503)
+        return deployment, runtime
 
     @asynccontextmanager
     async def prediction_runtime(self, model: str):
@@ -306,7 +309,9 @@ class DeploymentManager:
                     return True
                 async with self._fleet_lock:
                     snapshot = self._active_snapshot
-                return snapshot is not None and await self._runtime.health(snapshot.runtime)
+                if snapshot is None:
+                    return False
+                return all([await self._runtime.health(runtime) for runtime in snapshot.runtimes.values()])
         except Exception:
             self._logger.exception("readiness_check_failed")
             return False
@@ -319,29 +324,30 @@ class DeploymentManager:
         and requests fail safely with ``RUNTIME_UNAVAILABLE``.
         """
         active = await self._repository.list_active()
-        if active and all(item.metadata for item in active):
+        if active and all(item.metadata and item.runtime_id and item.runtime_image for item in active):
             try:
-                images = {item.runtime_image for item in active}
-                runtime_ids = {item.runtime_id for item in active}
-                if None in images or len(images) != 1:
-                    raise RuntimeError("Persisted active fleet has no single pinned runtime image")
-                if None in runtime_ids or len(runtime_ids) != 1:
-                    raise RuntimeError("Persisted active fleet has no single runtime ID")
-                runtime = await self._runtime.deploy(
-                    [item.metadata for item in active if item.metadata],
-                    image=images.pop(), runtime_id=runtime_ids.pop(),
-                )
-                await asyncio.wait_for(self._runtime.load(runtime), timeout=240)
-                if await asyncio.wait_for(self._runtime.health(runtime), timeout=2):
-                    for item in active:
+                groups: dict[str, list[Deployment]] = {}
+                for item in active:
+                    groups.setdefault(item.runtime_id or "", []).append(item)
+                runtimes: dict[str, RuntimeHandle] = {}
+                for runtime_id, members in groups.items():
+                    images = {item.runtime_image for item in members}
+                    if len(images) != 1 or None in images:
+                        raise RuntimeError(f"Persisted runtime group {runtime_id} has inconsistent image identities")
+                    runtime = await self._runtime.deploy(
+                        [item.metadata for item in members if item.metadata],
+                        image=next(iter(images)), runtime_id=runtime_id,
+                    )
+                    await asyncio.wait_for(self._runtime.load(runtime), timeout=240)
+                    if not await asyncio.wait_for(self._runtime.health(runtime), timeout=2):
+                        raise RuntimeError(f"Restored runtime group {runtime_id} failed healthcheck")
+                    for item in members:
                         assert item.metadata is not None
                         output = await asyncio.wait_for(self._runtime.predict(runtime, item.model, item.metadata.input_example), timeout=30)
                         _validate_output(item.metadata.output_schema, output)
-                    self._active_fleet = runtime
-                    self._active_fleet_deployments = {item.model: item for item in active}
-                    self._active_snapshot = FleetSnapshot(runtime, dict(self._active_fleet_deployments))
-                else:
-                    raise RuntimeError("Restored fleet healthcheck failed")
+                    runtimes[runtime_id] = runtime
+                self._runtime_handles.update(runtimes)
+                self._active_snapshot = FleetSnapshot(runtimes, {item.model: item for item in active})
             except Exception:
                 self._logger.exception("fleet_restore_failed", extra={"models": [item.model for item in active]})
         incomplete = await self._repository.list_incomplete()
@@ -370,9 +376,8 @@ class DeploymentManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         async with self._fleet_lock:
-            self._active_fleet = None
-            self._previous_fleet = None
             self._active_snapshot = None
+            self._previous_snapshot = None
         # Retained runtimes may still serve requests from another service slot.
         # Their expiry is owned by the running manager, not shutdown.
 
@@ -396,33 +401,33 @@ class DeploymentManager:
         if not task.cancelled() and task.exception() is not None:
             self._logger.error("background_task_failed", exc_info=task.exception(), extra={"deployment_id": task.get_name()})
 
-    def _schedule_expiry(self, runtime: RuntimeHandle, deployment: Deployment | None) -> None:
-        generation = self._expiry_generation.get(runtime.id, 0) + 1
-        self._expiry_generation[runtime.id] = generation
-        self._schedule(self._expire_previous_fleet(runtime, deployment, generation), f"expire_{runtime.id}")
+    def _schedule_snapshot_expiry(self, snapshot: FleetSnapshot) -> None:
+        self._schedule(self._expire_previous_snapshot(snapshot), f"expire_snapshot_{uuid4().hex[:8]}")
 
-    async def _expire_previous_fleet(self, runtime: RuntimeHandle, deployment: Deployment | None, generation: int) -> None:
+    async def _expire_previous_snapshot(self, snapshot: FleetSnapshot) -> None:
         await asyncio.sleep(self._previous_ttl_seconds)
         async with self._rollout_lock:
             async with self._fleet_lock:
-                if self._expiry_generation.get(runtime.id) != generation:
-                    return
-                if self._active_fleet and self._active_fleet.id == runtime.id:
-                    return
-                if self._previous_fleet and self._previous_fleet.id == runtime.id:
-                    self._previous_fleet = None
-                    self._previous_fleet_deployments = {}
-            async with self._idle:
-                await self._idle.wait_for(lambda: self._inflight.get(runtime.id, 0) == 0)
-            await self._runtime.stop(runtime)
-            self._inflight.pop(runtime.id, None)
-            self._expiry_generation.pop(runtime.id, None)
-            if deployment:
-                persisted = await self._repository.get(deployment.id)
-                if persisted and persisted.status == DeploymentStatus.STANDBY:
-                    persisted.status = DeploymentStatus.REMOVED
-                    await self._repository.save(persisted)
-                    self._metrics.runtime_status.labels(deployment.model, deployment.version, "standby").set(0)
+                active_ids = set(self._active_snapshot.runtimes) if self._active_snapshot else set()
+                retained_ids = set(self._previous_snapshot.runtimes) if self._previous_snapshot else set()
+                if self._previous_snapshot is snapshot:
+                    self._previous_snapshot = None
+            for runtime_id, runtime in snapshot.runtimes.items():
+                if runtime_id in active_ids or runtime_id in retained_ids:
+                    continue
+                async with self._idle:
+                    await self._idle.wait_for(lambda: self._inflight.get(runtime_id, 0) == 0)
+                await self._runtime.stop(runtime)
+                self._runtime_handles.pop(runtime_id, None)
+                self._inflight.pop(runtime_id, None)
+                for deployment in snapshot.deployments.values():
+                    if deployment.runtime_id != runtime_id or deployment.status != DeploymentStatus.STANDBY:
+                        continue
+                    persisted = await self._repository.get(deployment.id)
+                    if persisted and persisted.status == DeploymentStatus.STANDBY:
+                        persisted.status = DeploymentStatus.REMOVED
+                        await self._repository.save(persisted)
+                        self._metrics.runtime_status.labels(deployment.model, deployment.version, "standby").set(0)
 
 
 class PredictionService:
@@ -475,6 +480,8 @@ def _validate_metadata(metadata: ModelMetadata, deployment: Deployment) -> None:
         raise ServiceError("INPUT_EXAMPLE_REQUIRED", "Model input example is required", status_code=422)
     if not metadata.input_schema or not metadata.output_schema:
         raise ServiceError("MODEL_SIGNATURE_REQUIRED", "Model input and output signatures are required", status_code=422)
+    if not metadata.producer_image or not metadata.producer_image.strip():
+        raise ServiceError("MODEL_LOAD_FAILED", "MLflow model version has no producer image tag", status_code=422)
     try:
         for schema in (metadata.input_schema, metadata.output_schema):
             validator_for(schema).check_schema(schema)

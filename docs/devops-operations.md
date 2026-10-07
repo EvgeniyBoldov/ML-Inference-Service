@@ -4,53 +4,56 @@
 
 | Место | Назначение |
 | --- | --- |
-| Git `release.env` | Версии сервиса/base, хеш, pinned images, source SHA, DB revision. |
-| `projects/model-runtime-base/requirements.txt` | Все production-библиотеки API и моделей. |
-| `/etc/ml-inference-service/runtime.env` | Секреты, PostgreSQL, MLflow/S3, лимиты. |
-| `/etc/ml-inference-service/active-release.env` | Active и остановленный standby релизы. |
-| `/opt/ml-inference-service/releases/<версия>/` | Immutable bundle и runtime manifest каждого релиза. |
-| `/var/lib/ml-inference-service/model-artifacts/` | Кэш моделей, общий для API и fleet. |
+| Git `release.env` | Версия API, base digest, source SHA, DB revision и слоты. |
+| `projects/model-runtime-base/requirements.txt` | Зависимости API control plane. |
+| Версионированные Airflow/Jupyter images | Python/native dependencies исполняемых моделей, FastAPI и Uvicorn. |
+| `/etc/ml-inference-service/runtime.env` | Секреты, PostgreSQL, MLflow/S3 и лимиты. |
+| `/etc/ml-inference-service/active-release.env` | Active и standby API releases. |
+| `/var/lib/ml-inference-service/model-artifacts/` | Общий host cache artifacts и runtime manifests. |
+| PostgreSQL | Deployments, active routes и model/runtime metadata. |
 
-Runner не имеет Docker socket. Он вызывает root-owned
-`/usr/local/sbin/ml-inference-deploy` через ограниченный passwordless sudo.
-Bootstrap и установка controller описаны в [delivery.md](delivery.md).
-При переходе на единый release обновите установленный controller из репозитория.
+Runtime containers создаёт API через Docker socket. Они не имеют socket или
+production credentials. Bootstrap и установка controller описаны в
+[delivery.md](delivery.md).
 
-## Выпуск
+## Producer images
 
-На рабочей станции DevOps в production GitLab clone/default branch:
+Airflow и Jupyter должны выставлять `ML_INFERENCE_PRODUCER_IMAGE` в services,
+которые публикуют модели. Значение — уникальный tag соответствующего image,
+например `registry.company.local/ml-airflow:2026.10.06-17`. Image должен быть
+предварительно загружен на production host. Внутри image нужны модельные
+зависимости, MLflow, FastAPI, Uvicorn и UID/GID `10001`. Не переиспользуйте tag
+после изменения содержимого. Подробности — в
+[producer image runtime contract](model-runtime-base.md).
+
+## Выпуск API
 
 ```bash
 git add <изменённые-файлы>
-git commit -m "Update service or model dependencies"
+git commit -m "Update inference service"
 make release-preview
 make release
 ```
 
-`make release` сам собирает base при изменении Dockerfile/requirements,
-собирает API/runtime, пушит образы, записывает и коммитит `release.env`, пушит Git.
-Pipeline автоматически запускает `deploy_production` после проверок.
-
-На production новая версия проходит миграцию/healthcheck, переключается Nginx,
-затем останавливается прежний API. PostgreSQL и активный model fleet не останавливаются.
+`make release` собирает и публикует API image, записывает API release metadata
+в `release.env` и пушит Git commit. Production pipeline выполняет миграцию,
+blue/green API startup, readiness check и переключение Nginx. Общий model
+runtime image не собирается и не разворачивается.
 
 ```bash
 sudo /usr/local/sbin/ml-inference-deploy status
 curl --fail http://127.0.0.1:<active-port>/health/ready
 ```
 
-## Новые библиотеки моделей
-
-Добавьте библиотеку в общий requirements, закоммитьте и выполните `make release`.
-Дождитесь production deployment и повторите model deployment с новым Idempotency-Key.
-Отдельный release/delivery base больше не требуется.
-
 ## Откат и диагностика
 
-- `rollback_production` запускает сохранённый standby API, проверяет readiness,
-  переключает upstream и останавливает заменённый API. Миграции БД не откатываются.
-- Failed candidate не становится active; смотрите его логи в staged release.
-- Ошибки MLflow/загрузки моделей содержат traceback в JSON-поле `exception`.
-- Проверяйте runtime manifest текущего bundle, Docker network/cache/лимиты,
-  MLflow и S3 credentials в контейнере API.
-- Не очищайте artifacts и не редактируйте active-state/upstream вручную во время rollout.
+- `rollback_production` возвращает предыдущий API release. Миграции БД не
+  откатываются.
+- Failed model candidate не становится active; проверьте API logs и Docker logs
+  runtime container-а по labels `ml-inference-service.managed=true`.
+- `PRODUCER_IMAGE_UNAVAILABLE` означает, что tag из MLflow отсутствует в local
+  Docker image store сервера.
+- Проверяйте внутреннюю Docker network, права на общий artifact cache, MLflow
+  download settings и лимиты памяти/CPU.
+- Не очищайте artifacts и не редактируйте active-state/upstream вручную во время
+  rollout.

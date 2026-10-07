@@ -23,9 +23,8 @@ EOF
 require_root() { test "$EUID" -eq 0 || fail "deploy.sh must run through the root-owned controller."; }
 current_value() { local key="$1"; [[ -f "$STATE_FILE" ]] && sed -n "s/^${key}=//p" "$STATE_FILE" | tail -n 1 || true; }
 compose() {
-  # The validated release manifest is also the runtime image manifest.
   test -f "$RELEASE_DIR/release.env" && test -r "$RELEASE_DIR/release.env" || fail "Release manifest must be a readable file: $RELEASE_DIR/release.env"
-  INFERENCE_RUNTIME_ENV_FILE="$RUNTIME_ENV" MODEL_RUNTIME_MANIFEST_FILE="$RELEASE_DIR/release.env" SLOT_PORT="${SLOT_PORT:-1}" docker compose --project-name "$COMPOSE_PROJECT" --env-file "$RUNTIME_ENV" --env-file "$RELEASE_DIR/release.env" -f "$RELEASE_DIR/compose.yaml" "$@"
+  INFERENCE_RUNTIME_ENV_FILE="$RUNTIME_ENV" SLOT_PORT="${SLOT_PORT:-1}" docker compose --project-name "$COMPOSE_PROJECT" --env-file "$RUNTIME_ENV" --env-file "$RELEASE_DIR/release.env" -f "$RELEASE_DIR/compose.yaml" "$@"
 }
 validate_runtime() {
   require_command docker; require_command curl; require_command flock; require_command nginx; require_command systemctl
@@ -77,7 +76,7 @@ stop_release_service() (
 )
 verify_release_image() {
   local image actual_version actual_commit actual_base_sha
-  for image in "$REGISTRY/$IMAGE:$RELEASE_VERSION" "$RUNTIME_IMAGE"; do
+  for image in "$REGISTRY/$IMAGE:$RELEASE_VERSION"; do
     actual_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")"
     actual_commit="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
     actual_base_sha="$(docker image inspect --format '{{index .Config.Labels "com.ml-inference.runtime-input-sha256"}}' "$image")"
@@ -113,7 +112,6 @@ deploy() {
   load_bundle "$candidate_dir"
   install -d -m 0750 "$RELEASE_DIR"; COMPOSE_PROJECT="$project"; SLOT_PORT="$candidate_port"
   compose pull inference-service
-  docker pull "$RUNTIME_IMAGE"
   verify_release_image; verify_migrations
   compose run --rm --no-deps inference-service alembic upgrade "$DB_REVISION"
   compose up -d --force-recreate --remove-orphans --no-deps inference-service

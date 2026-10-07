@@ -1,7 +1,7 @@
 """Stable producer-side contracts for MLflow publication and deployment."""
 
 from .deployment import DeploymentClient, DeploymentError, DeploymentResult
-from .mlflow_logging import ModelContractError, ModelPublication, log_pyfunc_model
+from .mlflow_logging import PRODUCER_IMAGE_ENV, ModelContractError, ModelPublication, log_pyfunc_model
 
 __all__ = [
     "DeploymentClient",
@@ -9,6 +9,6 @@ __all__ = [
     "DeploymentResult",
     "ModelContractError",
     "ModelPublication",
+    "PRODUCER_IMAGE_ENV",
     "log_pyfunc_model",
 ]
-

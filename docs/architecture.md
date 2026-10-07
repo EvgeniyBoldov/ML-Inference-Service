@@ -11,7 +11,7 @@ only through MLflow URIs or artifact APIs.
 Airflow ── deployment request ──> Control plane ──> MLflow / artifact storage
                                       │
                                       ├── PostgreSQL (deployments and routes)
-                                      └── Runtime backend (blue / green)
+                                      └── Runtime groups (producer image per group)
 
 Clients / agents ── /v1 ──> Data plane ──> active local runtime
 ```
@@ -30,7 +30,7 @@ deployments but must not interrupt predictions for already active models.
 | MLflow adapter | Resolves model URI, metadata, signature, example, and artifact loading |
 | Schema adapter | Converts MLflow signatures to JSON Schema |
 | Routing service | Atomically reads and switches active/previous deployments |
-| Fleet runtime backend | Lifecycle одного изолированного контейнера для полного набора active-моделей |
+| Runtime-group backend | Lifecycle candidate/active контейнеров, сгруппированных по immutable producer image |
 | Repositories | Persistent deployments, routes, idempotency records |
 
 ## Deployment lifecycle
@@ -46,12 +46,11 @@ CREATED → DOWNLOADING → LOADING → WARMING_UP → READY → ACTIVE
 former ACTIVE → DRAINING → STANDBY → REMOVED
 ```
 
-Для новой версии менеджер проверяет контракт MLflow (registered model, version,
-loadable artifact, signature, input example и description), формирует полный
-набор active-моделей с кандидатом и создаёт GREEN fleet. Это один изолированный
-контейнер, который загружает все модели из общего immutable base image. Он
-проходит healthcheck и prediction/output-schema smoke test **для каждой** модели
-fleet. Только затем сервис атомарно меняет указатель на fleet. BLUE fleet
+Менеджер читает `ml_inference.producer_image`, разрешает его в локальный
+immutable Docker identity и добавляет модель в candidate только для этой
+runtime group. Контейнер загружает все модели группы из producer image,
+проходит healthcheck и prediction/output-schema smoke test для каждой модели.
+Только затем сервис атомарно обновляет route snapshot. Предыдущая группа
 дожидается старых запросов и хранится до rollback TTL.
 
 If any candidate step fails, it becomes `FAILED`; the existing active route is
@@ -67,7 +66,8 @@ technology:
 
 ```python
 class RuntimeBackend(Protocol):
-    async def deploy(self, models: list[ModelMetadata]) -> RuntimeHandle: ...
+    async def resolve_image(self, image: str | None) -> str | None: ...
+    async def deploy(self, models: list[ModelMetadata], *, image: str | None) -> RuntimeHandle: ...
     async def load(self, runtime: RuntimeHandle) -> None: ...
     async def predict(self, runtime: RuntimeHandle, model: str, payload: object) -> object: ...
     async def health(self, runtime: RuntimeHandle) -> bool: ...
@@ -75,13 +75,13 @@ class RuntimeBackend(Protocol):
     async def stop(self, runtime: RuntimeHandle) -> None: ...
 ```
 
-Production backend `DockerFleetRuntimeBackend` starts one Docker container per
-BLUE/GREEN fleet from the pinned runtime digest in the current release bundle’s `release.env`.
-Artifacts are first downloaded through MLflow into a shared host cache and are
-mounted read-only into fleet containers. Пакеты в production не устанавливаются:
-изменение зависимостей требует выпуска нового base image. Изоляция сохраняется
-между fleet и FastAPI, но не между отдельными моделями; совместимость всех
-active-моделей с одним набором зависимостей — обязательное правило платформы.
+Production backend `DockerFleetRuntimeBackend` starts containers from producer
+images already present in the local Docker image store (`--pull=never`). It
+mounts downloaded artifacts and the API-bundled runner read-only and overrides
+the producer entrypoint to launch Uvicorn. Model dependencies come from the
+producer environment; deployment never runs pip. Several models with the same
+resolved image identity share one group; different identities use separate
+containers.
 
 ## Persistence
 
@@ -94,10 +94,12 @@ deployment. On startup, restore routes and reconcile persisted runtime state wit
 the configured runtime backend.
 
 The current implementation contains a PostgreSQL SQLAlchemy repository selected
-by `INFERENCE_DATABASE_URL`; it persists deployment, route, idempotency, and
-normalized model metadata rows. `MLFLOW_TRACKING_URI` selects the MLflow metadata
-adapter. On restart the service reconstructs the active fleet from persisted
-active metadata without contacting MLflow.
+by `INFERENCE_DATABASE_URL`; it persists deployment, route, idempotency, producer
+image identity, and normalized model metadata. `MLFLOW_TRACKING_URI` selects the
+MLflow metadata adapter. On restart the service reconstructs active runtime
+groups from persisted active metadata without contacting MLflow. Previous
+snapshot retention is currently process-local, so rollback history does not
+survive API restart.
 
 ## API and security
 

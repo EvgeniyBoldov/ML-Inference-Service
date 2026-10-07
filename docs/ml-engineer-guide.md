@@ -124,26 +124,21 @@ deployment = client.deploy_and_wait(
 `models:/credit-scoring/19`.
 
 Сервис загрузит новую версию, выполнит prediction на input example, проверит
-output schema, прогреет runtime и атомарно переключит routing. При этом GREEN
-runtime загружает и smoke-тестит весь текущий набор моделей, а не только v19.
-v18 останется standby до истечения rollback TTL. Если любая модель в GREEN fleet
-не пройдёт проверку, переключения не будет и текущий BLUE fleet продолжит
-работать. Зарегистрированную версию нельзя изменять на месте.
+output schema, прогреет runtime и атомарно переключит routing. Candidate
+загружает и smoke-тестит все модели runtime group с тем же producer image.
+Несовместимые environments остаются в отдельных группах. Предыдущая версия
+остаётся на standby до истечения rollback TTL. Зарегистрированную версию нельзя
+изменять на месте.
 
 ## Зависимости модели и base image
 
-В production зависимости не скачиваются: все модели fleet используют один
-immutable runtime base image. Если deployment завершился `MODEL_LOAD_FAILED` и
-причина — отсутствующая или несовместимая библиотека, ML-инженер указывает точные
-пакеты и версии DevOps. DevOps добавляет их в
-`projects/model-runtime-base/requirements.txt`, выпускает и разворачивает полный service release с новым base и фиксирует
-его версию и digest в `release.env`.
-
-После этого Airflow повторно запускает deployment одной из active-моделей с
-**новым** `Idempotency-Key`. Это создаёт новый GREEN fleet из нового image и
-проверяет все модели. Одинаковый ключ используйте только для retry одного и того
-же запуска. Если проверка успешна, весь fleet переходит на новый image; если нет,
-BLUE fleet остаётся без изменений.
+В production зависимости не скачиваются. Runtime запускается из producer image,
+указанного при логировании модели в `ML_INFERENCE_PRODUCER_IMAGE`. При
+несовместимой библиотеке соберите новую версионированную Airflow/Jupyter image,
+доставьте её на production host и обновите переменную в producer service. Затем
+залогируйте и зарегистрируйте новую model version в этом environment и передайте
+её URI на deployment. Используйте новый `Idempotency-Key` для нового запуска.
+Модели с прежними image продолжают работать в своих runtime groups.
 
 Rollback относится к последнему успешному fleet-переходу. После следующего
 deployment старый fleet может быть уже не тем набором моделей, который нужен для

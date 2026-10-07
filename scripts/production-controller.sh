@@ -12,11 +12,9 @@ usage() { echo "Usage: ml-inference-deploy deploy --source CI_CHECKOUT --release
 set_current() { local target="$1" tmp="${APP_ROOT}/.current.$$.new"; ln -s "$target" "$tmp"; mv -Tf "$tmp" "$APP_ROOT/current"; }
 safe_source() { local source root; source="$(realpath -e "$1")" || fail "CI checkout is missing"; root="$(realpath -e "$CI_BUILDS_ROOT")" || fail "CI_BUILDS_ROOT is missing"; case "$source" in "$root"/*) printf '%s\n' "$source" ;; *) fail "CI source must be inside CI_BUILDS_ROOT" ;; esac; }
 stage() {
-  local source="$1" id="$2" dest tmp file version runtime_image
+  local source="$1" id="$2" dest tmp file version
   version="$(sed -n 's/^RELEASE_VERSION=//p' "$source/release.env")"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Release version must be X.Y.Z"
-  runtime_image="$(sed -n 's/^RUNTIME_IMAGE=//p' "$source/release.env")"
-  [[ "$runtime_image" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "Release RUNTIME_IMAGE must be pinned by digest"
   dest="${APP_ROOT}/releases/${version}"
   if [[ -e "$dest" ]]; then
     [[ -f "$dest/.release-id" && "$(<"$dest/.release-id")" == "$id" ]] || fail "Invalid existing release: $dest"

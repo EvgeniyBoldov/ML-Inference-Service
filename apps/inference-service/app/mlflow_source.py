@@ -63,10 +63,13 @@ class MlflowModelSource:
         owner = (model_version.tags.get("ml_inference.owner") or registered_model.tags.get("ml_inference.owner") or "").strip()
         if not owner:
             raise ServiceError("MODEL_LOAD_FAILED", "MLflow model owner tag ml_inference.owner is missing", status_code=422)
+        producer_image = (model_version.tags.get("ml_inference.producer_image") or "").strip()
+        if not producer_image:
+            raise ServiceError("MODEL_LOAD_FAILED", "MLflow model version tag ml_inference.producer_image is missing", status_code=422)
         return ModelMetadata(
             name=name, version=version, uri=uri, description=description, owner=owner,
             input_schema=input_schema, output_schema=output_schema, input_example=input_example,
-            artifact_path=str(artifact_dir),
+            producer_image=producer_image, artifact_path=str(artifact_dir),
             created_at=int(model_version.creation_timestamp / 1000),
         )
 

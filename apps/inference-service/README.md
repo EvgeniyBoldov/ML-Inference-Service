@@ -37,13 +37,15 @@ The initial FastAPI implementation is available in `app/main.py`:
   OpenAI-style error envelopes, and atomic in-memory active/previous routing.
 
 Adapters are deliberately injected at `create_app()`. `UnavailableModelSource` is
-the safe default when `MLFLOW_TRACKING_URI` is absent. In production, when
-`MODEL_RUNTIME_BASE_FILE` and `MODEL_ARTIFACT_CACHE_ROOT` are also configured,
-the app uses `MlflowModelSource` and `DockerFleetRuntimeBackend`. It resolves
-only immutable `models:/<name>/<version>` URIs, caches artifacts through MLflow,
-and starts a GREEN container containing the complete model fleet. Every model is
-loaded and smoke-tested before the active fleet pointer is switched. Tests use an
-in-process predictor runtime to exercise the endpoint contract.
+the safe default when `MLFLOW_TRACKING_URI` is absent. In production, the app uses
+`MlflowModelSource` and `DockerFleetRuntimeBackend` when MLflow and
+`MODEL_ARTIFACT_CACHE_ROOT` are configured. It resolves immutable
+`models:/<name>/<version>` URIs, caches artifacts through MLflow, resolves the
+model-version tag `ml_inference.producer_image` to a locally available immutable
+Docker image identity, and groups compatible models by that identity. A candidate
+container loads and smoke-tests its complete group before the route snapshot is
+switched. Tests use an in-process predictor runtime to exercise the endpoint
+contract.
 
 Set `INFERENCE_DATABASE_URL=postgresql+asyncpg://...` to use the durable
 `SqlAlchemyDeploymentRepository`; otherwise the local in-memory repository is
@@ -52,10 +54,12 @@ records. Production applies the Alembic migration before application startup.
 
 ## Tooling
 
-`projects/model-runtime-base/requirements.txt` defines production dependencies.
-The API and model runtime inherit the same dependency base; `make release` rebuilds
-that base only when its Dockerfile or requirements change. `pyproject.toml` contains
-package metadata and local test tooling.
+`projects/model-runtime-base/requirements.txt` defines API control-plane
+dependencies. Producer images provide runtime model dependencies, MLflow,
+FastAPI, and Uvicorn and must provide UID/GID `10001`. Configure
+`ML_INFERENCE_PRODUCER_IMAGE` in producer containers; see
+[`docs/model-runtime-base.md`](../../docs/model-runtime-base.md). `pyproject.toml`
+contains package metadata and local test tooling.
 
 For local application tests, install the shared dependencies and test tooling:
 
@@ -65,8 +69,7 @@ make test
 ```
 
 `make test-delivery` runs deployment regressions with simulated Docker and a local
-Git remote; it requires only Bash, Git and Python 3.10+ and also checks exception logs
-and release runtime manifests.
+Git remote; it requires only Bash, Git and Python 3.10+.
 
 ## Failure handling and resource limits
 

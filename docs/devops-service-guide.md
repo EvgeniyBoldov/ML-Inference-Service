@@ -99,8 +99,8 @@ make release
 ```
 
 `make release` требует чистый закоммиченный tree, автоматически повышает patch,
-проверяет хеш Dockerfile/requirements, при необходимости собирает новый base,
-собирает и пушит API/runtime, записывает версии и digest в `release.env`,
+проверяет хеш Dockerfile/requirements, при необходимости собирает новый API base,
+собирает и пушит API image, записывает версию и digest в `release.env`,
 коммитит и пушит manifest в upstream ветки. Для major/minor заранее задайте
 и закоммитьте в `release.env` версию `X.Y.0`; следующая команда выпустит `X.Y.1`.
 
@@ -147,8 +147,10 @@ curl --fail http://127.0.0.1:<active-port>/health/ready
 | Candidate не проходит `/health/ready` | Посмотреть `docker compose logs inference-service`; Nginx останется на старом slot. |
 | Ошибка Alembic | Исправить миграцию/DB доступ; candidate не поднимется. |
 | Нет доступа к registry | Проверить сетевую доступность VM и наличие image digest в registry. |
-| Runtime не стартует | Проверить runtime manifest текущего release bundle, Docker socket, сеть `ml-inference-runtime`, cache-directory и лимиты памяти. |
+| Runtime не стартует | Проверить наличие producer image из MLflow tag на локальном Docker Engine, логи runtime container-а, сеть `ml-inference-runtime`, cache-directory и лимиты памяти. |
 | Prediction работает, deployment нет | Проверить MLflow/artifact storage; active fleet не зависит от MLflow. |
 
-Для изменения Python-зависимостей моделей добавьте пакеты в общий requirements
-и выполните полный `make release`: base пересоберётся автоматически.
+Для изменения Python-зависимостей моделей выпустите новую версионированную
+Airflow/Jupyter image и доставьте её на production host. Затем обновите
+`ML_INFERENCE_PRODUCER_IMAGE` и повторно опубликуйте/deploy модель. API release
+для этого не нужен.

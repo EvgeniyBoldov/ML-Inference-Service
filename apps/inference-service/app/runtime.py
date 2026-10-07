@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ class RuntimeHandle:
 
 
 class RuntimeBackend(Protocol):
+    async def resolve_image(self, image: str | None) -> str | None: ...
     async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle: ...
     async def load(self, runtime: RuntimeHandle) -> None: ...
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any: ...
@@ -42,6 +44,9 @@ class PredictorRuntimeBackend:
 
     def __init__(self, predictors: dict[str, Any] | None = None) -> None:
         self._predictors = predictors or {}
+
+    async def resolve_image(self, image: str | None) -> str | None:
+        return image
 
     async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle:
         return RuntimeHandle(runtime_id or f"runtime_{uuid4().hex}", {model.name: model for model in models}, image)
@@ -66,18 +71,16 @@ class PredictorRuntimeBackend:
 
 
 class DockerFleetRuntimeBackend:
-    """Runs one Docker container with the complete immutable model-set revision.
+    """Runs one local producer-image container for a compatible model group.
 
     Model artifacts are downloaded by the control plane into a host path mounted
-    read-only into the container. The runtime image is read from an immutable
-    base-image manifest on each deployment, so a base rebuild affects only new
-    fleet revisions.
+    read-only into the container. The producer image is resolved to an immutable
+    local digest before a deployment and is never pulled by the runtime backend.
     """
 
     def __init__(
         self,
         *,
-        image_manifest: str,
         artifact_cache_root: str,
         network: str = "ml-inference-runtime",
         memory_limit: str | None = None,
@@ -86,7 +89,6 @@ class DockerFleetRuntimeBackend:
         command_timeout_seconds: float = 30.0,
         prediction_timeout_seconds: float = 30.0,
     ) -> None:
-        self._image_manifest = Path(image_manifest)
         self._cache_root = Path(artifact_cache_root).resolve()
         self._network = network
         self._memory_limit = memory_limit
@@ -98,13 +100,36 @@ class DockerFleetRuntimeBackend:
         self._prediction_timeout = prediction_timeout_seconds
         self._containers: dict[str, str] = {}
 
+    async def resolve_image(self, image: str | None) -> str:
+        if not image or not image.strip():
+            raise RuntimeError("Model version has no producer image")
+        image = image.strip()
+        status, output = await self._docker("image", "inspect", "--format", "{{.Id}} {{json .RepoDigests}}", image, check=False)
+        if status != 0:
+            raise ServiceError("PRODUCER_IMAGE_UNAVAILABLE", "Producer image is not present in the local Docker image store", status_code=422)
+        image_id, _, raw_digests = output.partition(" ")
+        if not image_id.startswith("sha256:"):
+            raise ServiceError("PRODUCER_IMAGE_UNAVAILABLE", "Docker Engine returned an invalid producer image identity", status_code=422)
+        try:
+            repo_digests = json.loads(raw_digests) if raw_digests else []
+        except json.JSONDecodeError:
+            repo_digests = []
+        if not isinstance(repo_digests, list):
+            repo_digests = []
+        repository = image.rsplit("@", 1)[0] if "@" in image else image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+        canonical = next((item for item in sorted(repo_digests) if item.startswith(f"{repository}@sha256:")), None)
+        # Image ID is also immutable and keeps locally built, unpushed images usable.
+        return canonical or image_id
+
     async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle:
         if not models:
             raise RuntimeError("A fleet must contain at least one model")
         for model in models:
             if not model.artifact_path:
                 raise RuntimeError(f"Model artifact is not cached for {model.name}")
-        return RuntimeHandle(runtime_id or f"fleet_{uuid4().hex}", {model.name: model for model in models}, image or self._read_image(), attach_existing=runtime_id is not None)
+        if not image:
+            raise RuntimeError("A producer image is required for a model runtime")
+        return RuntimeHandle(runtime_id or f"runtime_{uuid4().hex}", {model.name: model for model in models}, image, attach_existing=runtime_id is not None)
 
     async def load(self, runtime: RuntimeHandle) -> None:
         image = runtime.image
@@ -129,16 +154,29 @@ class DockerFleetRuntimeBackend:
         self._prepare_runtime_read_access(manifest_path)
         for model in runtime.models.values():
             self._prepare_runtime_read_access(Path(model.artifact_path or ""))
+        runner_dir = self._prepare_runner_source()
         logger.info("fleet_manifest_prepared", extra={"runtime_id": runtime.id, "model_count": len(runtime.models), "stage": "manifest"})
         if (await self._docker("network", "inspect", self._network, check=False))[0] != 0:
             await self._docker("network", "create", self._network)
-        args = ["run", "-d", "--name", name, "--network", self._network,
-                "--label", "ml-inference-service.runtime=fleet", "--label", f"ml-inference-service.fleet-id={runtime.id}"]
+        args = ["run", "-d", "--pull=never", "--name", name, "--network", self._network,
+                "--user", "10001:10001",
+                "--label", "ml-inference-service.managed=true",
+                "--label", "ml-inference-service.runtime=group",
+                "--label", f"ml-inference-service.runtime-id={runtime.id}",
+                "--label", f"ml-inference-service.image-id={image}"]
         if self._memory_limit:
             args.extend(["--memory", self._memory_limit])
         if self._cpu_limit:
             args.extend(["--cpus", self._cpu_limit])
-        args.extend(["-v", f"{self._cache_root}:/models:ro", "-e", f"MODEL_MANIFEST=/models/{manifest_path.name}", image])
+        args.extend([
+            "-v", f"{self._cache_root}:/models:ro",
+            "-v", f"{runner_dir}:/opt/ml-inference-runner:ro",
+            "-e", f"MODEL_MANIFEST=/models/{manifest_path.name}",
+            "-e", "PYTHONPATH=/opt/ml-inference-runner",
+            "-e", "PYTHONDONTWRITEBYTECODE=1",
+            "--entrypoint", "python", image,
+            "-m", "uvicorn", "runner:app", "--host", "0.0.0.0", "--port", "8080",
+        ])
         # Register before starting Docker so cancellation can clean up a container
         # created by the daemon even if the client never received its response.
         self._containers[runtime.id] = name
@@ -233,16 +271,20 @@ class DockerFleetRuntimeBackend:
             os.chown(resolved, -1, runtime_gid)
             os.chmod(resolved, stat.S_IMODE(resolved.stat().st_mode) | stat.S_IRGRP)
 
-    def _read_image(self) -> str:
-        values = {}
-        for line in self._image_manifest.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                key, value = line.split("=", 1)
-                values[key] = value
-        image = values.get("RUNTIME_IMAGE") or values.get("RUNTIME_BASE_IMAGE")
-        if not image or "@sha256:" not in image:
-            raise RuntimeError("runtime manifest must contain a pinned RUNTIME_IMAGE")
-        return image
+    def _prepare_runner_source(self) -> Path:
+        """Stage this API release's runner under the host-mounted cache for Docker bind mounting."""
+        source = Path(__file__).with_name("runtime_runner.py")
+        content = source.read_bytes()
+        version = hashlib.sha256(content).hexdigest()
+        runner_dir = self._cache_root / ".runtime-runner" / version
+        runner_dir.mkdir(parents=True, exist_ok=True)
+        runner_file = runner_dir / "runner.py"
+        if not runner_file.exists():
+            temporary = runner_dir / f".runner-{uuid4().hex}.tmp"
+            temporary.write_bytes(content)
+            os.replace(temporary, runner_file)
+        self._prepare_runtime_read_access(runner_file)
+        return runner_dir
 
     def _container_path(self, artifact: Path) -> str:
         return "/models/" + str(artifact.resolve().relative_to(self._cache_root))

@@ -31,11 +31,18 @@ present:
 | Input example | Valid representative input | Smoke test and API documentation |
 | Registered-model or model-version description | Non-empty human-readable purpose | Agent/MCP discovery description |
 | `ml_inference.owner` tag | Owning team/service | Public `owned_by` field |
+| `ml_inference.producer_image` tag | Exact producer image tag | Selects the local image and runtime compatibility group |
 
 The publisher writes these optional tags when supplied: `ml_inference.contract_version`,
 `ml_inference.source_git_commit`, `ml_inference.params_schema`, and
 `ml_inference.extra_metadata`. Tags are JSON strings where applicable. They are
 read-only metadata to the serving system and must not contain secrets or PII.
+
+Before calling the publisher, configure `ML_INFERENCE_PRODUCER_IMAGE` in the
+Airflow/Jupyter service, for example `registry.company.local/ml-airflow:2026.10.06-17`.
+The value must uniquely identify a build and the corresponding image must already
+be available on the production Docker host. The publisher records it as
+`ml_inference.producer_image`; callers cannot override this reserved tag.
 
 `input_example` must match the signature input. The supplied `output_example`
 must be the result shape expected from that input and is used to infer or verify
@@ -49,7 +56,10 @@ The distributable package lives in `packages/ml-inference-contracts`. It does
 not require Airflow, so it can be used in Jupyter as well as a DAG task.
 
 ```python
-from ml_inference_contracts import log_pyfunc_model
+from ml_inference_contracts import PRODUCER_IMAGE_ENV, log_pyfunc_model
+
+# Set by the versioned Airflow/Jupyter image:
+# ML_INFERENCE_PRODUCER_IMAGE=registry.company.local/ml-airflow:2026.10.06-17
 
 publication = log_pyfunc_model(
     registered_model_name="credit-scoring",
@@ -63,6 +73,7 @@ publication = log_pyfunc_model(
 )
 
 print(publication.model_uri)  # models:/credit-scoring/18
+print(publication.producer_image)
 ```
 
 The function fails before publishing if required local fields are missing and
@@ -107,4 +118,3 @@ tags, the MLmodel artifact metadata (signature and input example), and the
 PyFunc artifact via MLflow. It persists a normalized copy of this metadata before
 activation. Prediction, catalog reads, and schema validation then use that local
 copy and never call MLflow.
-

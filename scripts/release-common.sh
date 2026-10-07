@@ -32,7 +32,6 @@ load_release_file() {
     [[ "${BASE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "BASE_VERSION must be X.Y.Z"
     [[ "${BASE_INPUT_SHA256:-}" =~ ^[a-f0-9]{64}$ ]] || fail "BASE_INPUT_SHA256 must be a SHA256"
     [[ "${BASE_IMAGE:-}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "BASE_IMAGE must be pinned by digest"
-    [[ "${RUNTIME_IMAGE:-}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "RUNTIME_IMAGE must be pinned by digest"
     [[ "${DB_REVISION:-}" =~ ^[A-Za-z0-9_]+$ ]] || fail "DB_REVISION is required"
   fi
   [[ "$BLUE_PORT" =~ ^[0-9]+$ && "$GREEN_PORT" =~ ^[0-9]+$ ]] || fail "BLUE_PORT and GREEN_PORT must be numeric"

@@ -29,14 +29,14 @@ MLflow-backed model metadata, isolated runtimes, and blue/green traffic switchin
   deployment of a new MLflow model version.
 - [Observability and access](docs/observability-and-access.md) — Prometheus
   metrics and local two-role token administration.
-- [Model runtime base](docs/model-runtime-base.md) — общий base image и
-  глобальный blue/green rollout полного набора моделей.
+- [Producer image runtime contract](docs/model-runtime-base.md) — producer image
+  metadata, local image resolution, runtime grouping, and runner mounts.
 - [Delivery](docs/delivery.md) — Docker release, GitLab shell-runner deployment,
   host Nginx blue/green switching, and rollback process.
 - [DevOps: основной сервис](docs/devops-service-guide.md) — подготовка VM,
   выпуск FastAPI-образа, GitLab delivery и откат.
-- [DevOps: base runtime](docs/devops-runtime-base-guide.md) — выпуск общего
-  образа зависимостей моделей и его применение к полному fleet.
+- [DevOps: producer images](docs/devops-runtime-base-guide.md) — сборка и доставка
+  Airflow/Jupyter environments для model inference.
 - [DevOps: эксплуатация](docs/devops-operations.md) — короткий runbook VM,
   выпусков, отката и расположения production-файлов.
 - [Development guide](apps/inference-service/README.md) — code-package layout

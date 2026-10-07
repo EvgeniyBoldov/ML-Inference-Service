@@ -23,11 +23,11 @@ class ReleaseTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
-        for name in ("scripts/release.sh", "scripts/release-common.sh", "projects/model-runtime-base/Dockerfile", "projects/model-runtime-base/Dockerfile.runtime", "projects/model-runtime-base/requirements.txt", "projects/model-runtime-base/runner.py", "apps/inference-service/Dockerfile", "release.env"):
+        for name in ("scripts/release.sh", "scripts/release-common.sh", "projects/model-runtime-base/Dockerfile", "projects/model-runtime-base/requirements.txt", "apps/inference-service/Dockerfile", "apps/inference-service/app/runtime_runner.py", "release.env"):
             target = self.repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / name, target)
-        (self.repo / "release.env").write_text("RELEASE_VERSION=0.1.0\nRELEASE_COMMIT=\nREGISTRY=registry.test\nIMAGE=service\nBASE_VERSION=0.1.0\nBASE_INPUT_SHA256=\nBASE_IMAGE=\nRUNTIME_IMAGE=\nDB_REVISION=\nBLUE_PORT=18001\nGREEN_PORT=18002\n")
+        (self.repo / "release.env").write_text("RELEASE_VERSION=0.1.0\nRELEASE_COMMIT=\nREGISTRY=registry.test\nIMAGE=service\nBASE_VERSION=0.1.0\nBASE_INPUT_SHA256=\nBASE_IMAGE=\nDB_REVISION=\nBLUE_PORT=18001\nGREEN_PORT=18002\n")
         self.git("init", "-b", "main")
         self.git("config", "user.email", "delivery@test.invalid")
         self.git("config", "user.name", "Delivery Test")
@@ -93,7 +93,7 @@ if args[0] == "run" and args[-1] == "heads":
         self.assertEqual(len(self.base_builds()), 1)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/main"))
         self.assertEqual(self.git("status", "--porcelain"), "")
-        runner = self.repo / "projects/model-runtime-base/runner.py"
+        runner = self.repo / "apps/inference-service/app/runtime_runner.py"
         runner.write_text(runner.read_text() + "\n# code change\n")
         self.commit("runner update")
         result = self.publish()
@@ -102,7 +102,8 @@ if args[0] == "run" and args[-1] == "heads":
         self.assertEqual(len(self.base_builds()), 1)
         self.assertEqual(first["BASE_IMAGE"], second["BASE_IMAGE"])
         self.assertEqual(first["BASE_INPUT_SHA256"], second["BASE_INPUT_SHA256"])
-        self.assertNotEqual(first["RUNTIME_IMAGE"], second["RUNTIME_IMAGE"])
+        self.assertNotIn("RUNTIME_IMAGE", first)
+        self.assertNotIn("RUNTIME_IMAGE", second)
         req = self.repo / "projects/model-runtime-base/requirements.txt"
         req.write_text(req.read_text() + "\nnew-model-library==1.0\n")
         self.commit("new model dependency")
@@ -154,20 +155,20 @@ if args[0] == "run" and args[-1] == "heads":
 
 
 class DeployTests(unittest.TestCase):
-    def test_compose_mounts_release_manifest_despite_old_runtime_directory(self):
+    def test_compose_does_not_mount_release_manifest_into_api(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "release.env").write_text("RUNTIME_IMAGE=registry.test/runtime@sha256:" + "a" * 64 + "\n")
+            (root / "release.env").write_text("RELEASE_VERSION=0.1.0\n")
             (root / "runtime-base.env").mkdir()
             script = r'''
 source "$DEPLOY_SCRIPT"
 RELEASE_DIR="$FIXTURE"; COMPOSE_PROJECT=test
-docker() { printf '%s\n' "$MODEL_RUNTIME_MANIFEST_FILE"; }
+docker() { printf '%s\n' "$*"; }
 compose up -d inference-service
 '''
             result = run(["bash", "-c", script], env=dict(os.environ, DEPLOY_SCRIPT=str(ROOT / "scripts/deploy.sh"), FIXTURE=tmp))
             self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertEqual(result.stdout.strip(), str(root / "release.env"))
+            self.assertNotIn("MODEL_RUNTIME_MANIFEST_FILE", result.stdout)
 
     def test_compose_rejects_missing_or_directory_manifest_before_docker(self):
         for directory in (False, True):
@@ -208,7 +209,7 @@ declare -A state=( [ACTIVE_SLOT]=blue [ACTIVE_PORT]=18001 [ACTIVE_PROJECT]=ml-in
 current_value() { printf '%s' "${state[$1]:-}"; }
 load_bundle() {
   RELEASE_DIR="$1"; REGISTRY=registry.test; IMAGE=service; BLUE_PORT=18001; GREEN_PORT=18002
-  RELEASE_VERSION=0.1.2; RELEASE_COMMIT=abc; DB_REVISION=revision; RUNTIME_IMAGE=runtime@sha256:abc
+  RELEASE_VERSION=0.1.2; RELEASE_COMMIT=abc; DB_REVISION=revision
   COMPOSE_PROJECT=ml-inference-0-1-2
 }
 compose() { echo "compose:$COMPOSE_PROJECT:$*" >> "$CALLS"; }

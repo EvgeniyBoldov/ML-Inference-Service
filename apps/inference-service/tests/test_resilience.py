@@ -98,7 +98,7 @@ async def test_maintenance_failure_preserves_promoted_fleet():
         assert upgraded.status == DeploymentStatus.ACTIVE
         assert (await repository.active_for("credit")).id == upgraded.id
         assert (await PredictionService(manager, runtime).predict("credit", {"age": 38}))[1] == {"prediction": 2}
-        assert any(task.get_name().startswith("expire_") for task in manager._tasks)
+        assert any(task.get_name().startswith("expire_snapshot_") for task in manager._tasks)
     finally:
         await manager.shutdown()
 
@@ -141,7 +141,7 @@ async def test_unavailable_previous_runtime_does_not_change_routes():
         assert error.value.status_code == 503
         assert (await repository.active_for("credit")).id == upgrade.id
         runtime.health = AsyncMock(return_value=True)
-        manager._previous_fleet = None
+        manager._previous_snapshot = None
         with pytest.raises(ServiceError):
             await manager.rollback("credit", expected_deployment_id=upgrade.id)
         assert (await repository.active_for("credit")).id == upgrade.id
@@ -160,14 +160,13 @@ async def test_expiry_waits_for_predictions_and_ignores_invalidated_timer():
             await deploy(manager, version="2")
             await asyncio.sleep(0)
             runtime.stop.assert_not_awaited()
-        expiry_tasks = [task for task in manager._tasks if task.get_name().startswith("expire_")]
+        expiry_tasks = [task for task in manager._tasks if task.get_name().startswith("expire_snapshot_")]
         await asyncio.gather(*expiry_tasks)
         runtime.stop.assert_awaited_once_with(pinned)
-        active = manager._active_fleet
-        manager._expiry_generation[pinned.id] = 2
-        await manager._expire_previous_fleet(pinned, None, 1)
+        active = manager._active_snapshot
+        await manager._expire_previous_snapshot(manager._previous_snapshot or manager._active_snapshot)
         assert runtime.stop.await_count == 1
-        assert manager._active_fleet == active
+        assert manager._active_snapshot == active
     finally:
         await manager.shutdown()
 
@@ -250,7 +249,7 @@ async def test_auth_storage_failure_is_service_unavailable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_docker_command_timeout_reaps_process(tmp_path):
-    runtime = DockerFleetRuntimeBackend(image_manifest=str(tmp_path / "manifest"), artifact_cache_root=str(tmp_path), command_timeout_seconds=0.01)
+    runtime = DockerFleetRuntimeBackend(artifact_cache_root=str(tmp_path), command_timeout_seconds=0.01)
     process = AsyncMock()
     process.returncode = None
     process.kill = lambda: setattr(process, "returncode", -9)
@@ -272,7 +271,7 @@ async def test_docker_command_timeout_reaps_process(tmp_path):
 
 
 def test_runtime_transport_errors_are_classified(tmp_path):
-    runtime = DockerFleetRuntimeBackend(image_manifest=str(tmp_path / "manifest"), artifact_cache_root=str(tmp_path))
+    runtime = DockerFleetRuntimeBackend(artifact_cache_root=str(tmp_path))
     handle = RuntimeHandle("fleet", {})
     runtime._containers[handle.id] = "fleet"
     for cause, code, status in [(URLError("connection refused"), "RUNTIME_UNAVAILABLE", 503), (TimeoutError(), "MODEL_PREDICTION_TIMEOUT", 504)]:
@@ -336,7 +335,7 @@ async def test_ambiguous_promotion_does_not_delete_persisted_active_runtime():
 
 @pytest.mark.asyncio
 async def test_restore_does_not_remove_unhealthy_persisted_container(tmp_path):
-    runtime = DockerFleetRuntimeBackend(image_manifest=str(tmp_path / "manifest"), artifact_cache_root=str(tmp_path))
+    runtime = DockerFleetRuntimeBackend(artifact_cache_root=str(tmp_path))
     runtime._docker = AsyncMock(return_value=(0, "exists"))
     runtime.health = AsyncMock(return_value=False)
     handle = RuntimeHandle("fleet", {}, "image@sha256:123", attach_existing=True)

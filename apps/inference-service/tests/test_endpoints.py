@@ -24,6 +24,7 @@ class FakeModelSource:
             },
             output_schema={"type": "object", "properties": {"prediction": {"type": "integer"}}, "required": ["prediction"]},
             input_example={"age": 38},
+            producer_image="test/producer:unit",
         )
 
 

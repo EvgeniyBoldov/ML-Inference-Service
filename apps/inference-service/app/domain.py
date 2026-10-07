@@ -31,6 +31,7 @@ class ModelMetadata:
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     input_example: Any
+    producer_image: str | None = None
     artifact_path: str | None = None
     created_at: int = field(default_factory=lambda: int(time()))
 

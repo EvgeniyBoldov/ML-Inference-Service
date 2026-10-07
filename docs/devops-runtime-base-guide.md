@@ -1,41 +1,35 @@
-# Инструкция DevOps: библиотеки и base
+# DevOps: producer images and runtime environments
 
-Production-зависимости API и моделей задаются только в
-`projects/model-runtime-base/requirements.txt`. Они устанавливаются при локальной
-сборке base. API и model runtime наследуют его; production VM только скачивает образы.
+The Inference Service does not install model libraries and does not pull
+producer images during deployment. Airflow and Jupyter images carry the Python
+environment used to load their models.
 
-## Добавление библиотеки модели
+## Producer image build contract
 
-```bash
-# После изменения projects/model-runtime-base/requirements.txt:
-git add projects/model-runtime-base/requirements.txt
-git commit -m "Add model library"
-make release-preview
-make release
+Each Airflow/Jupyter build should use a unique immutable tag and include:
+
+- the model's Python and native dependencies;
+- `mlflow`, `fastapi`, and `uvicorn`;
+- a user/group with UID/GID `10001`.
+
+Set this variable in the corresponding Airflow/Jupyter services:
+
+```text
+ML_INFERENCE_PRODUCER_IMAGE=registry.company.local/ml-airflow:2026.10.06-17
 ```
 
-`make release-preview` показывает текущую и следующую версии сервиса/base,
-сохранённый и вычисленный хеши, необходимость пересборки base.
-`make release` автоматически собирает base при изменении Dockerfile или requirements,
-затем собирает API и runtime, пушит образы, коммитит и пушит `release.env`.
+The Airflow scheduler and workers that publish models must use the same image
+and value. The logging package writes the variable to model-version tag
+`ml_inference.producer_image`. Never reuse a tag for different contents.
 
-При изменении только кода base используется повторно. `runner.py` копируется в
-отдельный runtime image каждого релиза и не входит в хеш dependency base.
+## Production rollout
 
-## Production
+Preload the exact producer image on the production Docker host before deploying
+a model. Runtime startup uses `--pull=never`; absent images produce
+`PRODUCER_IMAGE_UNAVAILABLE`. Keep old images while active groups or rollback
+retention still use them. See [the runtime contract](model-runtime-base.md).
 
-GitLab `deploy_production` скачивает API и pinned runtime, проверяет версии, source
-commit и хеш base в labels образов. Controller фиксирует runtime в manifest именно
-этого релиза. Отдельная job доставки base и общий изменяемый `runtime-base.env` в
-`/etc` больше не требуются.
-
-После успешного production deployment ML-инженер повторяет model deployment с
-новым `Idempotency-Key`. Без релиза с нужной библиотекой модель не загрузится;
-работающий fleet продолжит обслуживать запросы.
-
-Для проверки текущего релиза:
-
-```bash
-sudo /usr/local/sbin/ml-inference-deploy status
-sudo cat /opt/ml-inference-service/current/release.env
-```
+The API release still builds its own dependencies from
+`projects/model-runtime-base/requirements.txt`; changing those affects the
+control plane only. Changing model dependencies requires a new producer image,
+updated producer variable, and redeployment of the model.

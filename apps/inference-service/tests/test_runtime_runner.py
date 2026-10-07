@@ -17,7 +17,7 @@ def runner():
     mlflow = ModuleType("mlflow")
     pyfunc = ModuleType("mlflow.pyfunc")
     mlflow.pyfunc = pyfunc
-    spec = importlib.util.spec_from_file_location("inference_runtime_runner", Path(__file__).resolve().parents[3] / "projects/model-runtime-base/runner.py")
+    spec = importlib.util.spec_from_file_location("inference_runtime_runner", Path(__file__).resolve().parents[3] / "apps/inference-service/app/runtime_runner.py")
     module = importlib.util.module_from_spec(spec)
     with patch.dict("sys.modules", {"mlflow": mlflow, "mlflow.pyfunc": pyfunc}):
         spec.loader.exec_module(module)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 
 CONTRACT_VERSION = "1"
 TAG_PREFIX = "ml_inference."
+PRODUCER_IMAGE_ENV = "ML_INFERENCE_PRODUCER_IMAGE"
 
 
 class ModelContractError(ValueError):
@@ -25,6 +27,7 @@ class ModelPublication:
     model_uri: str
     run_id: str
     artifact_path: str
+    producer_image: str
 
 
 def log_pyfunc_model(
@@ -53,6 +56,8 @@ def log_pyfunc_model(
     _require_text("description", description)
     _require_text("owner", owner)
     _require_text("artifact_path", artifact_path)
+    producer_image = os.getenv(PRODUCER_IMAGE_ENV, "").strip()
+    _require_text(PRODUCER_IMAGE_ENV, producer_image)
     if input_example is None:
         raise ModelContractError("input_example is required")
     if output_example is None:
@@ -61,6 +66,11 @@ def log_pyfunc_model(
         raise ModelContractError("python_model is required")
     _ensure_json_mapping("params_schema", params_schema)
     _ensure_tag_values(tags)
+    reserved_tags = {"contract_version", "owner", "description", "producer_image", "source_git_commit", "params_schema"}
+    conflicting_tags = reserved_tags.intersection(tags or {})
+    if conflicting_tags:
+        names = ", ".join(sorted(conflicting_tags))
+        raise ModelContractError(f"tags cannot override reserved ML inference tags: {names}")
 
     try:
         import mlflow
@@ -74,6 +84,7 @@ def log_pyfunc_model(
         f"{TAG_PREFIX}contract_version": CONTRACT_VERSION,
         f"{TAG_PREFIX}owner": owner.strip(),
         f"{TAG_PREFIX}description": description.strip(),
+        f"{TAG_PREFIX}producer_image": producer_image,
     }
     if source_git_commit:
         run_tags[f"{TAG_PREFIX}source_git_commit"] = source_git_commit.strip()
@@ -143,6 +154,7 @@ def _log_and_register(
         model_uri=f"models:/{model_name}/{version_text}",
         run_id=run_id,
         artifact_path=artifact_path,
+        producer_image=contract_tags[f"{TAG_PREFIX}producer_image"],
     )
 
 
@@ -175,4 +187,3 @@ def _ensure_tag_values(tags: Mapping[str, str] | None) -> None:
     for key, value in tags.items():
         _require_text("tag key", key)
         _require_text(f"tag '{key}'", value)
-

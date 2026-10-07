@@ -204,7 +204,8 @@ def _metadata_to_json(metadata: ModelMetadata | None) -> dict[str, Any] | None:
     return {
         "name": metadata.name, "version": metadata.version, "uri": metadata.uri, "description": metadata.description,
         "owner": metadata.owner, "input_schema": metadata.input_schema, "output_schema": metadata.output_schema,
-        "input_example": metadata.input_example, "artifact_path": metadata.artifact_path, "created_at": metadata.created_at,
+        "input_example": metadata.input_example, "producer_image": metadata.producer_image,
+        "artifact_path": metadata.artifact_path, "created_at": metadata.created_at,
     }
 
 
