@@ -1,7 +1,8 @@
 # Build and production delivery
 
 `make release` builds and publishes the inference API image, checks its
-dependencies and Alembic head, then commits the API release manifest. It does
+dependencies and Alembic head, builds the React dashboard into that same image,
+then commits the API release manifest. It does
 not build a model-runtime image: production model containers use versioned
 Airflow and Jupyter producer images already loaded onto the production Docker
 host.
@@ -10,8 +11,10 @@ The API release manifest pins its API image's base image and records the source
 commit, API release version, database revision, and blue/green ports. The
 production controller stages the manifest and Compose file, pulls only the API
 image, verifies its labels and migrations, starts the candidate service, waits
-for readiness, and switches Nginx. PostgreSQL remains shared between API
-releases.
+for readiness, and switches Nginx. The dashboard is served at `/dashboard/` by
+the same blue/green service, so UI and API always switch as one release. Host
+Nginx terminates HTTPS using certificates provisioned separately under
+`/etc/ml-inference-service/tls/`. PostgreSQL remains shared between API releases.
 
 ## Producer images
 

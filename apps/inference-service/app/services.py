@@ -167,7 +167,8 @@ class DeploymentManager:
             deployment.status = DeploymentStatus.WARMING_UP
             await self._repository.save(deployment)
             for fleet_model in group_models:
-                output = await asyncio.wait_for(self._runtime.predict(runtime, fleet_model.name, fleet_model.input_example), timeout=30)
+                warmup = getattr(self._runtime, "warmup", self._runtime.predict)
+                output = await asyncio.wait_for(warmup(runtime, fleet_model.name, fleet_model.input_example), timeout=30)
                 _validate_output(fleet_model.output_schema, output)
                 json.dumps(output, allow_nan=False)
             deployment.status = DeploymentStatus.READY
@@ -281,6 +282,71 @@ class DeploymentManager:
 
     async def catalog(self) -> list[Deployment]:
         return await self._repository.list_active()
+
+    async def runtime_inventory(self, runtime_id: str | None = None, *, include_statistics: bool = True) -> dict[str, Any]:
+        """Describe active runtime groups and read counters from the model processes."""
+        async with self._fleet_lock:
+            snapshot = self._active_snapshot
+        deployments = list(snapshot.deployments.values()) if snapshot else await self._repository.list_active()
+        groups: dict[str, list[Deployment]] = {}
+        for deployment in deployments:
+            identity = deployment.runtime_id or f"missing-{deployment.id}"
+            groups.setdefault(identity, []).append(deployment)
+        if runtime_id is not None:
+            if runtime_id not in groups:
+                raise ServiceError("RUNTIME_NOT_FOUND", "Active runtime was not found", status_code=404, param="runtime_id")
+            groups = {runtime_id: groups[runtime_id]}
+        capacity = asyncio.Semaphore(8)
+
+        async def describe(identity: str, members: list[Deployment]) -> dict[str, Any]:
+            handle = snapshot.runtimes.get(identity) if snapshot else None
+            kind = getattr(self._runtime, "kind", "runtime")
+
+            async def health() -> str:
+                if handle is None:
+                    return "unavailable"
+                try:
+                    healthy = await asyncio.wait_for(self._runtime.health(handle), timeout=3)
+                    return "healthy" if healthy else "unhealthy"
+                except Exception:
+                    return "unhealthy"
+
+            async def statistics() -> dict[str, Any] | None:
+                read = getattr(self._runtime, "statistics", None)
+                if not include_statistics or handle is None or read is None:
+                    return None
+                try:
+                    result = await asyncio.wait_for(read(handle), timeout=3)
+                    return result if isinstance(result, dict) and isinstance(result.get("statistics"), dict) else None
+                except Exception:
+                    return None
+
+            async with capacity:
+                state, measurements = await asyncio.gather(health(), statistics())
+            models = []
+            for deployment in sorted(members, key=lambda item: item.model):
+                measurement = measurements["statistics"].get(deployment.model) if measurements else None
+                required = ("total", "completed", "failed", "in_progress")
+                if not isinstance(measurement, dict) or not all(isinstance(measurement.get(key), (int, float)) and measurement[key] >= 0 for key in required):
+                    measurement = None
+                models.append({
+                    "id": deployment.model, "version": deployment.version,
+                    "deployment_id": deployment.id,
+                    "requests": {key: measurement.get(key) for key in (*required, "average_latency_ms")} if measurement else None,
+                })
+            return {
+                "id": identity, "kind": kind,
+                "container_name": handle.container_name if handle else identity.replace("_", "-") if kind == "docker" else None,
+                "image": handle.image if handle else members[0].runtime_image,
+                "producer_image": members[0].metadata.producer_image if members[0].metadata else None,
+                "status": state, "checked_at": time(), "models": models,
+                "statistics_status": "available" if measurements and all(model["requests"] is not None for model in models) else "unavailable",
+                "started_at": measurements.get("started_at") if measurements else None,
+                "uptime_seconds": measurements.get("uptime_seconds") if measurements else None,
+            }
+
+        data = await asyncio.gather(*(describe(identity, members) for identity, members in sorted(groups.items())))
+        return {"data": data, "checked_at": time(), "metrics_source": "runtime"}
 
     def metric_model(self, model: str) -> str:
         return model if self._active_snapshot and model in self._active_snapshot.deployments else "unknown"
@@ -409,9 +475,9 @@ class DeploymentManager:
         async with self._rollout_lock:
             async with self._fleet_lock:
                 active_ids = set(self._active_snapshot.runtimes) if self._active_snapshot else set()
-                retained_ids = set(self._previous_snapshot.runtimes) if self._previous_snapshot else set()
                 if self._previous_snapshot is snapshot:
                     self._previous_snapshot = None
+                retained_ids = set(self._previous_snapshot.runtimes) if self._previous_snapshot else set()
             for runtime_id, runtime in snapshot.runtimes.items():
                 if runtime_id in active_ids or runtime_id in retained_ids:
                     continue

@@ -8,9 +8,9 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from functools import partial
-from time import monotonic
+from time import monotonic, time
 from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger("uvicorn.error")
@@ -22,6 +22,9 @@ from pydantic import BaseModel
 
 
 MODELS: dict[str, Any] = {}
+MODEL_STATISTICS: dict[str, dict[str, Any]] = {}
+STARTED_AT = time()
+STARTED_MONOTONIC = monotonic()
 MAX_CONCURRENT_PREDICTIONS = int(os.getenv("MAX_CONCURRENT_PREDICTIONS", "64"))
 if MAX_CONCURRENT_PREDICTIONS < 1:
     raise ValueError("MAX_CONCURRENT_PREDICTIONS must be positive")
@@ -49,6 +52,7 @@ async def lifespan(_app: FastAPI):
     yield
     logger.info("runtime_shutdown_started")
     MODELS.clear()
+    MODEL_STATISTICS.clear()
     logger.info("runtime_shutdown_completed")
 
 
@@ -58,6 +62,31 @@ app = FastAPI(lifespan=lifespan)
 class PredictRequest(BaseModel):
     model: str
     input: Any
+    purpose: Literal["inference", "warmup"] = "inference"
+
+
+def _statistics(name: str) -> dict[str, Any]:
+    return MODEL_STATISTICS.setdefault(name, {
+        "total": 0, "completed": 0, "failed": 0, "in_progress": 0,
+        "duration_seconds": 0.0,
+    })
+
+
+@app.get("/statistics")
+async def statistics() -> dict[str, Any]:
+    result = {}
+    for name in sorted(MODELS):
+        row = _statistics(name)
+        finished = row["completed"] + row["failed"]
+        result[name] = {
+            key: row[key] for key in ("total", "completed", "failed", "in_progress")
+        }
+        result[name]["average_latency_ms"] = round(row["duration_seconds"] * 1000 / finished, 2) if finished else None
+    return {
+        "status": "ok", "models": sorted(MODELS), "started_at": STARTED_AT,
+        "uptime_seconds": round(monotonic() - STARTED_MONOTONIC, 3),
+        "statistics": result,
+    }
 
 
 @app.get("/health")
@@ -73,14 +102,26 @@ async def predict(request: PredictRequest) -> dict[str, Any]:
     if PREDICTION_CAPACITY.locked():
         raise HTTPException(status_code=503, detail="prediction capacity is exhausted")
     async with PREDICTION_CAPACITY:
+        row = _statistics(request.model) if request.purpose == "inference" else None
+        started = monotonic()
+        succeeded = False
+        if row is not None:
+            row["total"] += 1
+            row["in_progress"] += 1
         try:
             output = await run_in_threadpool(partial(model.predict, request.input))
             output = _to_jsonable(output)
             json.dumps(output, allow_nan=False)
+            succeeded = True
             return {"output": output}
         except Exception as exc:
             logging.getLogger("ml_inference.runtime").exception("model_prediction_failed", extra={"model": request.model})
             raise HTTPException(status_code=500, detail="model prediction failed") from exc
+        finally:
+            if row is not None:
+                row["completed" if succeeded else "failed"] += 1
+                row["in_progress"] -= 1
+                row["duration_seconds"] += monotonic() - started
 
 
 def _to_jsonable(value: Any) -> Any:

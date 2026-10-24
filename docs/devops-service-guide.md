@@ -14,10 +14,33 @@ Production VM ничего не собирает и не устанавлива�
 решения, какой образ основного сервиса разворачивать. Секреты и окружение живут
 только в `/etc/ml-inference-service/runtime.env`.
 
+## Локальный стек в Docker Compose
+
+Локальный Compose поднимает PostgreSQL, API и React-панель. API выполняет
+миграции перед запуском, а панель доступна только на loopback-порту `8081`:
+
+```bash
+docker compose -f infra/compose/local-inference.compose.yaml up --build -d
+```
+
+Откройте `http://localhost:8081/dashboard/`. Локальный пароль PostgreSQL и
+режим trusted proxy из этого Compose предназначены только для разработки;
+панель привязана к `127.0.0.1`, а API не публикует host-порт. Для подключения
+MLflow задайте одновременно `MLFLOW_TRACKING_URI` и
+`MODEL_ARTIFACT_CACHE_ROOT` в окружении Compose. Деплой модели также требует,
+чтобы её producer image был загружен в локальный Docker Engine.
+
+Остановить стек можно командой:
+
+```bash
+docker compose -f infra/compose/local-inference.compose.yaml down
+```
+
 ## Однократная подготовка production VM
 
 Нужны Docker Engine и Compose plugin, GitLab shell runner, Nginx и сетевой доступ
-к внутреннему MLflow, MinIO через MLflow и registry. PostgreSQL описан в общем
+к внутреннему MLflow, MinIO через MLflow и registry. Для внешнего доступа нужен
+DNS hostname этой VM и TLS-сертификат с полной цепочкой. PostgreSQL описан в общем
 Compose-файле; deployment job запускает его один раз под постоянным именем
 проекта, отдельно от blue/green service slots. Runner **не должен** иметь
 доступ к Docker socket или прямой `sudo` к `install`, `nginx` и `systemctl`.
@@ -28,6 +51,7 @@ Compose-файле; deployment job запускает его один раз п�
 
 ```bash
 sudo install -d -m 0750 /etc/ml-inference-service
+sudo install -d -m 0750 /etc/ml-inference-service/tls
 sudo install -d -m 0750 /var/lib/ml-inference-service/model-artifacts
 sudo install -m 0640 /dev/null /etc/ml-inference-service/runtime.env
 sudo docker network create ml-inference-runtime || true
@@ -51,13 +75,77 @@ MODEL_FLEET_MEMORY_LIMIT=24g
 MODEL_FLEET_CPU_LIMIT=8
 PREVIOUS_RUNTIME_TTL_SECONDS=3600
 FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS=180
+# Only when every route is protected by the trusted ingress authentication.
+INFERENCE_TRUSTED_PROXY_AUTH=true
 ```
 
 `PASSWORD` в URL должен соответствовать `POSTGRES_PASSWORD`; URL не должен
 содержать неэкранированные символы `@`, `:`, `/` или `#`.
 
-Compose передаёт весь защищённый `runtime.env` в API-контейнер через `env_file`.
-MLflow и boto3 читают указанные AWS-переменные для авторизации в MinIO. Используйте
+### Входной HTTPS и панель
+
+React-панель собирается вместе с API image и доступна через тот же active
+upstream по `/dashboard/`; отдельные frontend-порт, image и переменные для UI в
+production не нужны. `make release` собирает UI внутри Docker build и публикует
+готовый образ, поэтому production VM не устанавливает Node/npm и не собирает
+frontend.
+
+DNS-запись домена сервиса должна вести на production VM, а входящие TCP-порты
+`80` и `443` должны быть доступны Nginx. Положите сертификат и закрытый ключ
+сюда (или настройте автоматизацию сертификатов создавать эти пути):
+
+```text
+/etc/ml-inference-service/tls/fullchain.pem
+/etc/ml-inference-service/tls/privkey.pem
+```
+
+Закрытый ключ должен читаться master-процессом Nginx (обычно `root:root`, mode
+`0600`). В `infra/nginx/ml-inference-service.conf` укажите реальный домен в обоих
+`server_name` вместо `_`. Конфигурация перенаправляет HTTP на HTTPS, завершает
+TLS на Nginx и проксирует панель и API в активный blue/green slot. Установите её
+один раз на VM:
+
+```bash
+sudo install -m 0644 infra/nginx/ml-inference-service.conf /etc/nginx/conf.d/ml-inference-service.conf
+sudo install -m 0644 infra/nginx/ml-inference-service-upstream.conf.example /etc/nginx/conf.d/ml-inference-service-upstream.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Проверьте, что порт в начальном upstream совпадает с `BLUE_PORT` или
+`GREEN_PORT` из `release.env`. До первого успешного deployment домен не
+направляйте на эту VM; deployment controller сам переключает upstream на
+проверенную версию.
+
+При обновлении сертификата выполняйте `nginx -t` и reload Nginx после замены
+файлов. TLS сам по себе не заменяет общую авторизацию: если используется
+`INFERENCE_TRUSTED_PROXY_AUTH=true`, перед публичным трафиком должен стоять
+корпоративный SSO/auth proxy, который защищает `/`, `/dashboard/`, `/v1/`,
+`/internal/v1/` и остальные пути. Ограничьте прямой доступ к VM и loopback-портам
+blue/green только доверенным источникам. Не включайте trusted proxy mode, если
+этот auth gate отсутствует. Этот Nginx завершает TLS, но сам не выполняет вход
+через SSO.
+
+Для Nginx дополнительных environment variables нет: hostname задаётся в
+`server_name`, сертификатные пути — в `ssl_certificate` и
+`ssl_certificate_key`. Переменные API/БД/MLflow остаются в
+`/etc/ml-inference-service/runtime.env`, приведённом выше; секреты и пути TLS
+не записывайте в `release.env` или Git.
+
+`/etc/ml-inference-service/runtime.env` — единственный env-файл runtime. В нём
+обязательны `INFERENCE_DATABASE_URL`, `POSTGRES_DB`, `POSTGRES_USER` и
+`POSTGRES_PASSWORD`; для включения model deployment задайте вместе
+`MLFLOW_TRACKING_URI` и `MODEL_ARTIFACT_CACHE_ROOT`. `MLFLOW_S3_ENDPOINT_URL`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` и `AWS_DEFAULT_REGION` нужны только
+при прямом доступе API к S3/MinIO; лимиты `MODEL_FLEET_MEMORY_LIMIT`,
+`MODEL_FLEET_CPU_LIMIT`, `PREVIOUS_RUNTIME_TTL_SECONDS` и
+`FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS` необязательны. `INFERENCE_TRUSTED_PROXY_AUTH`
+включайте только за общей авторизацией, как описано выше.
+
+API получает защищённый `runtime.env` через `env_file`; контейнер PostgreSQL
+получает только `POSTGRES_DB`, `POSTGRES_USER` и `POSTGRES_PASSWORD`. `make release`
+и `release.env` не требуют новых переменных для панели или HTTPS. MLflow и boto3
+читают AWS-переменные для авторизации в MinIO. Используйте
 отдельный MinIO service account с правами чтения нужного bucket; замените
 `MINIO_SERVICE_ACCESS_KEY` и `MINIO_SERVICE_SECRET_KEY` его значениями. Секреты
 не добавляются в Git, release manifest, логи или ответы status-эндпоинта.
@@ -82,9 +170,9 @@ sudo scripts/manage-inference-token.sh create predict
 sudo scripts/manage-inference-token.sh create deploy
 ```
 
-Скопируйте Nginx-конфигурацию из `infra/nginx/`, выполните `sudo nginx -t` и
-`sudo systemctl reload nginx`. Первичный upstream должен указывать на один из
-локальных портов из `release.env` только после первого успешного deployment.
+После установки сертификата и Nginx-конфигурации выполните `sudo nginx -t` и
+`sudo systemctl reload nginx`. Deployment controller атомарно обновляет upstream
+только после readiness-check candidate service.
 
 ## Обычный выпуск приложения
 
@@ -100,7 +188,7 @@ make release
 
 `make release` требует чистый закоммиченный tree, автоматически повышает patch,
 проверяет хеш Dockerfile/requirements, при необходимости собирает новый API base,
-собирает и пушит API image, записывает версию и digest в `release.env`,
+собирает UI и API в одном production image, публикует image, записывает версию и digest в `release.env`,
 коммитит и пушит manifest в upstream ветки. Для major/minor заранее задайте
 и закоммитьте в `release.env` версию `X.Y.0`; следующая команда выпустит `X.Y.1`.
 

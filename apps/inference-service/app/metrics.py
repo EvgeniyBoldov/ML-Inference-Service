@@ -31,6 +31,39 @@ class ServiceMetrics:
     def exposition(self) -> bytes:
         return generate_latest(self.registry)
 
+    def prediction_statistics(self) -> dict[str, Any]:
+        """Prediction counters only: dashboard polling and health checks are excluded."""
+        models: dict[tuple[str, str], dict[str, Any]] = {}
+        totals = {"total": 0, "completed": 0, "failed": 0}
+        for family in self.prediction_requests.collect():
+            for sample in family.samples:
+                if sample.name != "prediction_requests_total":
+                    continue
+                key = (sample.labels["model"], sample.labels["version"])
+                row = models.setdefault(key, {
+                    "model": key[0], "version": key[1], "total": 0,
+                    "completed": 0, "failed": 0, "average_latency_ms": None,
+                })
+                count = int(sample.value)
+                outcome = "completed" if sample.labels["status"] == "completed" else "failed"
+                row["total"] += count
+                row[outcome] += count
+                totals["total"] += count
+                totals[outcome] += count
+        durations: dict[tuple[str, str], dict[str, float]] = {}
+        for family in self.prediction_latency.collect():
+            for sample in family.samples:
+                if sample.labels.get("kind") != "total":
+                    continue
+                if sample.name not in {"prediction_latency_seconds_sum", "prediction_latency_seconds_count"}:
+                    continue
+                key = (sample.labels["model"], sample.labels["version"])
+                durations.setdefault(key, {})[sample.name.rsplit("_", 1)[1]] = sample.value
+        for key, values in durations.items():
+            if key in models and values.get("count", 0):
+                models[key]["average_latency_ms"] = round(1000 * values["sum"] / values["count"], 2)
+        return {**totals, "by_model": [models[key] for key in sorted(models)]}
+
     def request_statistics(self) -> dict[str, Any]:
         """Read the same counters exported to Prometheus; do not keep a second log."""
         totals = {"total": 0, "successful": 0, "client_errors": 0, "server_errors": 0}

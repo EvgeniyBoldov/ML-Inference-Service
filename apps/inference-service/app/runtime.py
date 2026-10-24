@@ -10,6 +10,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic, time
 from typing import Any, Protocol
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,7 @@ class RuntimeHandle:
     models: dict[str, ModelMetadata]
     image: str | None = None
     attach_existing: bool = False
+    container_name: str | None = None
 
 
 class RuntimeBackend(Protocol):
@@ -34,6 +36,7 @@ class RuntimeBackend(Protocol):
     async def deploy(self, models: list[ModelMetadata], *, image: str | None = None, runtime_id: str | None = None) -> RuntimeHandle: ...
     async def load(self, runtime: RuntimeHandle) -> None: ...
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any: ...
+    async def statistics(self, runtime: RuntimeHandle) -> dict[str, Any]: ...
     async def health(self, runtime: RuntimeHandle) -> bool: ...
     async def drain(self, runtime: RuntimeHandle) -> None: ...
     async def stop(self, runtime: RuntimeHandle) -> None: ...
@@ -42,8 +45,11 @@ class RuntimeBackend(Protocol):
 class PredictorRuntimeBackend:
     """In-process fleet backend used only for local tests and development."""
 
+    kind = "in_process"
+
     def __init__(self, predictors: dict[str, Any] | None = None) -> None:
         self._predictors = predictors or {}
+        self._statistics: dict[str, dict[str, Any]] = {}
 
     async def resolve_image(self, image: str | None) -> str | None:
         return image
@@ -55,10 +61,37 @@ class PredictorRuntimeBackend:
         missing = [model.uri for model in runtime.models.values() if model.uri not in self._predictors]
         if missing:
             raise RuntimeError(f"No runtime loader registered for {missing[0]}")
+        self._statistics.setdefault(runtime.id, {"started_at": time(), "models": {}})
 
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any:
+        row = self._statistics.setdefault(runtime.id, {"started_at": time(), "models": {}})
+        metric = row["models"].setdefault(model, {"total": 0, "completed": 0, "failed": 0, "in_progress": 0, "duration_seconds": 0.0})
+        metric["total"] += 1
+        metric["in_progress"] += 1
+        started = monotonic()
+        succeeded = False
+        try:
+            result = await self.warmup(runtime, model, payload)
+            succeeded = True
+            return result
+        finally:
+            metric["completed" if succeeded else "failed"] += 1
+            metric["in_progress"] -= 1
+            metric["duration_seconds"] += monotonic() - started
+
+    async def warmup(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any:
         metadata = runtime.models[model]
         return await asyncio.to_thread(self._predictors[metadata.uri], payload)
+
+    async def statistics(self, runtime: RuntimeHandle) -> dict[str, Any]:
+        row = self._statistics.setdefault(runtime.id, {"started_at": time(), "models": {}})
+        result = {}
+        for name in runtime.models:
+            metric = row["models"].get(name, {"total": 0, "completed": 0, "failed": 0, "in_progress": 0, "duration_seconds": 0.0})
+            finished = metric["completed"] + metric["failed"]
+            result[name] = {key: metric[key] for key in ("total", "completed", "failed", "in_progress")}
+            result[name]["average_latency_ms"] = round(metric["duration_seconds"] * 1000 / finished, 2) if finished else None
+        return {"status": "ok", "models": sorted(runtime.models), "started_at": row["started_at"], "uptime_seconds": time() - row["started_at"], "statistics": result}
 
     async def health(self, runtime: RuntimeHandle) -> bool:
         return all(model.uri in self._predictors for model in runtime.models.values())
@@ -67,6 +100,7 @@ class PredictorRuntimeBackend:
         return None
 
     async def stop(self, runtime: RuntimeHandle) -> None:
+        self._statistics.pop(runtime.id, None)
         return None
 
 
@@ -77,6 +111,8 @@ class DockerFleetRuntimeBackend:
     read-only into the container. The producer image is resolved to an immutable
     local digest before a deployment and is never pulled by the runtime backend.
     """
+
+    kind = "docker"
 
     def __init__(
         self,
@@ -129,7 +165,8 @@ class DockerFleetRuntimeBackend:
                 raise RuntimeError(f"Model artifact is not cached for {model.name}")
         if not image:
             raise RuntimeError("A producer image is required for a model runtime")
-        return RuntimeHandle(runtime_id or f"runtime_{uuid4().hex}", {model.name: model for model in models}, image, attach_existing=runtime_id is not None)
+        identity = runtime_id or f"runtime_{uuid4().hex}"
+        return RuntimeHandle(identity, {model.name: model for model in models}, image, attach_existing=runtime_id is not None, container_name=identity.replace("_", "-"))
 
     async def load(self, runtime: RuntimeHandle) -> None:
         image = runtime.image
@@ -171,7 +208,9 @@ class DockerFleetRuntimeBackend:
         args.extend([
             "-v", f"{self._cache_root}:/models:ro",
             "-v", f"{runner_dir}:/opt/ml-inference-runner:ro",
+            "-v", "/opt/models:/opt/models:ro",
             "-e", f"MODEL_MANIFEST=/models/{manifest_path.name}",
+            "-e", "EMBED_BASE_DIR=/opt/models",
             "-e", "PYTHONPATH=/opt/ml-inference-runner",
             "-e", "PYTHONDONTWRITEBYTECODE=1",
             "--entrypoint", "python", image,
@@ -208,6 +247,12 @@ class DockerFleetRuntimeBackend:
 
     async def predict(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any:
         return await asyncio.to_thread(self._http_json, runtime, "/predict", {"model": model, "input": payload})
+
+    async def warmup(self, runtime: RuntimeHandle, model: str, payload: Any) -> Any:
+        return await asyncio.to_thread(self._http_json, runtime, "/predict", {"model": model, "input": payload, "purpose": "warmup"})
+
+    async def statistics(self, runtime: RuntimeHandle) -> dict[str, Any]:
+        return await asyncio.to_thread(self._http_json, runtime, "/statistics", None)
 
     async def health(self, runtime: RuntimeHandle) -> bool:
         try:
@@ -309,6 +354,8 @@ class DockerFleetRuntimeBackend:
                 raise ValueError("Runtime health does not match the requested fleet")
             return body
         except HTTPError as exc:
+            if path == "/statistics" and exc.code == 404:
+                raise ServiceError("RUNTIME_STATISTICS_UNAVAILABLE", "Runtime does not expose model statistics", status_code=503) from exc
             if exc.code in {429, 503}:
                 raise ServiceError("SERVICE_OVERLOADED", "Runtime prediction capacity is unavailable", status_code=503) from exc
             raise ServiceError("MODEL_PREDICTION_FAILED", "Runtime rejected the prediction request", status_code=502) from exc

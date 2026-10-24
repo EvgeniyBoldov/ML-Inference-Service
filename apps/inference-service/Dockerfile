@@ -1,4 +1,11 @@
 ARG BASE_IMAGE
+FROM node:22-alpine AS dashboard-build
+WORKDIR /dashboard
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY ui/ ./
+RUN npm run build
+
 FROM ${BASE_IMAGE} AS runtime
 
 ARG RELEASE_VERSION
@@ -21,6 +28,7 @@ RUN apt-get update \
 
 WORKDIR /srv/app
 COPY app ./app
+COPY --from=dashboard-build /dashboard/dist ./app/static/dashboard
 COPY alembic.ini ./
 COPY migrations ./migrations
 USER runtime

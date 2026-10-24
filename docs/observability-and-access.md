@@ -48,6 +48,18 @@ is degraded; load balancers should continue using `/health/ready`. Storage or ru
 failure makes status degraded without suppressing request statistics. Credentials,
 request inputs and exception details are excluded.
 
+The dashboard reads `GET /internal/v1/runtimes` for per-container and per-model
+statistics directly from model runner processes. Health checks, API validation
+failures, and deployment warmup do not increment those counters. Each runtime
+reports completed/failed/in-progress calls and average invocation latency.
+Counters survive an API restart and reset when their model container restarts.
+Older runners without `/statistics` return unavailable measurements in the
+inventory; the dashboard does not substitute API counters or zeroes.
+
+The status `predictions` field and Prometheus prediction metrics remain API-side
+observations. `capabilities.deployments.available` reports whether the MLflow
+adapter is configured; it does not test upstream connectivity.
+
 ```bash
 curl --fail -H "Authorization: Bearer $DEPLOY_TOKEN" \
   http://127.0.0.1:<active-port>/internal/v1/status

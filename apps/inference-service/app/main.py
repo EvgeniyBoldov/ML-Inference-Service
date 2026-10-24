@@ -5,17 +5,19 @@ from __future__ import annotations
 import os
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from time import perf_counter, time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 
-from .auth import FileTokenAuth, StaticTokenAuth
+from .auth import FileTokenAuth, StaticTokenAuth, TrustedProxyAuth
 from .domain import Deployment
 from .errors import ServiceError
 from .mlflow_source import MlflowModelSource
@@ -60,6 +62,7 @@ def create_app(
     runtime = runtime or (
         DockerFleetRuntimeBackend(
             artifact_cache_root=os.environ["MODEL_ARTIFACT_CACHE_ROOT"],
+            network=os.getenv("MODEL_FLEET_DOCKER_NETWORK", "ml-inference-runtime"),
             memory_limit=os.getenv("MODEL_FLEET_MEMORY_LIMIT"),
             cpu_limit=os.getenv("MODEL_FLEET_CPU_LIMIT"),
             startup_timeout_seconds=float(os.getenv("FLEET_RUNTIME_STARTUP_TIMEOUT_SECONDS", "180")),
@@ -88,7 +91,11 @@ def create_app(
     metrics = ServiceMetrics()
     manager = DeploymentManager(repository, source, runtime, metrics, previous_ttl_seconds=int(os.getenv("PREVIOUS_RUNTIME_TTL_SECONDS", "3600")), max_pending_deployments=int(os.getenv("MAX_PENDING_DEPLOYMENTS", "32")))
     prediction = PredictionService(manager, runtime, timeout_seconds=float(os.getenv("PREDICTION_TIMEOUT_SECONDS", "30")), max_concurrent=int(os.getenv("MAX_CONCURRENT_PREDICTIONS", "64")))
-    auth = auth or (FileTokenAuth(os.environ["INFERENCE_TOKEN_FILE"]) if os.getenv("INFERENCE_TOKEN_FILE") else StaticTokenAuth())
+    if auth is None:
+        if os.getenv("INFERENCE_TRUSTED_PROXY_AUTH", "false").lower() in {"1", "true", "yes"}:
+            auth = TrustedProxyAuth()
+        else:
+            auth = FileTokenAuth(os.environ["INFERENCE_TOKEN_FILE"]) if os.getenv("INFERENCE_TOKEN_FILE") else StaticTokenAuth()
     app.state.deployment_manager = manager
     app.state.metrics = metrics
 
@@ -165,17 +172,44 @@ def create_app(
 
     @app.get("/internal/v1/status")
     async def service_status(_: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
-        return {**await manager.operational_status(), **metrics.request_statistics()}
+        deployment_available = not isinstance(source, UnavailableModelSource)
+        return {
+            **await manager.operational_status(), **metrics.request_statistics(),
+            "predictions": metrics.prediction_statistics(),
+            "capabilities": {"deployments": {
+                "available": deployment_available,
+                "reason": None if deployment_available else "MLFLOW_NOT_CONFIGURED",
+            }},
+        }
 
     @app.get("/v1/models", response_model=ModelList, responses={401: {"model": ErrorResponse}})
     async def list_models(_: None = Depends(auth.require("inference.read"))) -> ModelList:
         deployments = await manager.catalog()
         return ModelList(data=[_model_object(item) for item in deployments])
 
+    @app.get("/internal/v1/runtimes")
+    async def list_runtimes(_: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
+        return await manager.runtime_inventory()
+
+    @app.get("/internal/v1/runtimes/{runtime_id}/health")
+    async def runtime_health(runtime_id: str, _: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
+        inventory = await manager.runtime_inventory(runtime_id, include_statistics=False)
+        return {key: inventory["data"][0][key] for key in ("id", "container_name", "status", "checked_at")}
+
     @app.get("/v1/models/{model}", response_model=ModelObject, responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
     async def get_model(model: str, _: None = Depends(auth.require("inference.read"))) -> ModelObject:
         deployment, _runtime = await manager.active(model)
         return _model_object(deployment, include_deployment=True)
+
+    @app.get("/v1/models/{model}/health")
+    async def model_health(model: str, _: None = Depends(auth.require("inference.read"))) -> dict[str, Any]:
+        deployment, model_runtime = await manager.active(model)
+        healthy = await runtime.health(model_runtime)
+        return {
+            "status": "healthy" if healthy else "unhealthy",
+            "model": model,
+            "version": deployment.version,
+        }
 
     @app.post("/v1/responses", response_model=ResponseObject, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
     async def response(body: ResponseRequest, request: Request, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:
@@ -223,6 +257,14 @@ def create_app(
             raise ServiceError("DEPLOYMENT_NOT_FOUND", "Deployment was not found", status_code=404, param="deployment_id")
         active = await manager.rollback(deployment.model, expected_deployment_id=deployment_id)
         return _deployment_object(active)
+
+    dashboard_dir = Path(__file__).resolve().parent / "static" / "dashboard"
+    if dashboard_dir.is_dir():
+        @app.get("/", include_in_schema=False)
+        async def dashboard_root() -> RedirectResponse:
+            return RedirectResponse("/dashboard/", status_code=302)
+
+        app.mount("/dashboard", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
 
     return app
 

@@ -30,6 +30,15 @@ class StaticTokenAuth:
         return dependency
 
 
+class TrustedProxyAuth:
+    """No-op authorization for deployments protected by a trusted ingress proxy."""
+
+    def require(self, role: str) -> Callable[..., None]:
+        async def dependency() -> None:
+            return None
+        return dependency
+
+
 class FileTokenAuth:
     """Role-based Bearer authentication from a small, reloadable local file.
 

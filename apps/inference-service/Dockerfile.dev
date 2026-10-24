@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /srv/app
+COPY projects/model-runtime-base/requirements.txt /tmp/runtime-requirements.txt
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y docker-cli \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r /tmp/runtime-requirements.txt
+
+COPY apps/inference-service/app ./app
+COPY apps/inference-service/alembic.ini ./alembic.ini
+COPY apps/inference-service/migrations ./migrations
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
