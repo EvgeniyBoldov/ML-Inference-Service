@@ -5,6 +5,23 @@ import { checkedAt, countLabel, runtimeStateLabel, runtimeTotals } from './runti
 
 export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect, onRefresh, refreshing }) {
   const [checks, setChecks] = useState({});
+  const [pending, setPending] = useState(null);
+  const [actionError, setActionError] = useState(null);
+  const actionLock = useRef(false);
+  const act = async (kind, id, action) => {
+    if (actionLock.current) return;
+    actionLock.current = true;
+    setPending(`${kind}:${id}:${action}`);
+    setActionError(null);
+    try {
+      await request(`/internal/v1/${kind}/${encodeURIComponent(id)}/${action}`, { method: 'POST', timeout: 600000 });
+      setChecks({});
+    } catch (cause) { setActionError(cause.message); }
+    finally {
+      try { await onRefresh(); }
+      finally { actionLock.current = false; setPending(null); }
+    }
+  };
   const controllers = useRef(new Map());
   useEffect(() => () => controllers.current.forEach(controller => controller.abort()), []);
 
@@ -22,26 +39,28 @@ export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect
   };
 
   return <section className="panel runtime-panel" aria-labelledby="models-title">
-    <div className="panel-heading"><div><h2 id="models-title">Контейнеры и модели</h2><p>Активные модели сгруппированы по runtime, который обслуживает запросы.</p></div><span className="count-badge">{runtimes === null ? '—' : countLabel(runtimes.length, 'группа', 'группы', 'групп')}</span></div>
+    <div className="panel-heading"><div><h2 id="models-title">Контейнеры и модели</h2><p>Управление контейнерами и моделями, включая выключенные.</p></div><span className="count-badge">{runtimes === null ? '—' : countLabel(runtimes.length, 'группа', 'группы', 'групп')}</span></div>
+    {pending && <p role="status">Выполняется операция… Запуск и редеплой могут занять несколько минут.</p>}
+    {actionError && <p className="field-error" role="alert">{actionError}</p>}
     {error && <div className="inline-notice notice-warning" role="alert"><Icon name="alert" /><span>Не удалось обновить контейнеры. {error} Показаны последние доступные данные.</span></div>}
     {!runtimes?.length ? <div className="empty-state"><span className="empty-icon"><Icon name="model" size={28} /></span><strong>{error ? 'Список контейнеров недоступен' : runtimes === null ? 'Получаем контейнеры…' : 'Активных контейнеров пока нет'}</strong><p>{error ? 'Повторите обновление состояния сервиса.' : 'После развёртывания здесь появятся контейнеры, состав моделей и их собственные счётчики запросов.'}</p>{error ? <button type="button" className="button button-quiet" disabled={refreshing} onClick={() => void onRefresh()}>Повторить обновление</button> : runtimes !== null && <a className="button button-quiet" href="#deploy">Перейти к развёртыванию<Icon name="arrow" size={15} /></a>}</div> : <div className="runtime-groups">{runtimes.map(runtime => {
       const lastCheck = checks[runtime.id];
       const current = lastCheck?.status === 'checking' || (lastCheck?.checked_at || 0) > (runtime.checked_at || 0) ? lastCheck : runtime;
       const totals = runtimeTotals([runtime]);
       return <article className="runtime-card" key={runtime.id} data-runtime-id={runtime.id}>
-        <div className="runtime-heading"><div className="runtime-identity"><span className="model-glyph"><Icon name="model" size={20} /></span><div><h3>{runtime.kind === 'docker' ? 'Контейнер' : 'Runtime'} <code>{runtime.container_name || runtime.id}</code></h3><p className="runtime-image" title={runtime.producer_image || runtime.image}>{runtime.producer_image || runtime.image || 'Встроенный runtime'}</p></div></div><div className="runtime-actions"><span className={`runtime-health health-${current.status}`} role="status"><i />{runtimeStateLabel(current.status)}</span><button type="button" className="button button-quiet" disabled={current.status === 'checking'} onClick={() => void check(runtime)} aria-label={`Проверить runtime ${runtime.container_name || runtime.id}`}><Icon name={current.status === 'checking' ? 'refresh' : 'activity'} className={current.status === 'checking' ? 'spinning' : ''} />{current.status === 'checking' ? 'Проверяем…' : 'Проверить'}</button></div></div>
+        <div className="runtime-heading"><div className="runtime-identity"><span className="model-glyph"><Icon name="model" size={20} /></span><div><h3>{runtime.kind === 'docker' ? 'Контейнер' : 'Runtime'} <code>{runtime.container_name || runtime.id}</code></h3><p className="runtime-image" title={runtime.producer_image || runtime.image}>{runtime.producer_image || runtime.image || 'Встроенный runtime'}</p></div></div><div className="runtime-actions"><button type="button" className="button button-quiet" disabled={!!pending} onClick={() => void act('runtimes', runtime.id, runtime.status === 'stopped' ? 'start' : 'stop')}>{runtime.status === 'stopped' ? 'Включить' : 'Выключить'}</button><button type="button" className="button button-quiet" disabled={!!pending} onClick={() => void act('runtimes', runtime.id, 'redeploy')}>Редеплой из MLflow</button><span className={`runtime-health health-${current.status}`} role="status"><i />{runtimeStateLabel(current.status)}</span><button type="button" className="button button-quiet" disabled={!!pending || current.status === 'checking'} onClick={() => void check(runtime)} aria-label={`Проверить runtime ${runtime.container_name || runtime.id}`}><Icon name={current.status === 'checking' ? 'refresh' : 'activity'} className={current.status === 'checking' ? 'spinning' : ''} />{current.status === 'checking' ? 'Проверяем…' : 'Проверить'}</button></div></div>
         <div className="runtime-summary"><span>{countLabel(runtime.models.length, 'модель', 'модели', 'моделей')}</span><span>Запросов: <strong>{number(totals.complete ? totals.total : undefined)}</strong></span><span>Ошибок: <strong>{number(totals.complete ? totals.failed : undefined)}</strong></span><span>Проверка: {checkedAt(current.checked_at)}</span></div>
         {current.message && <p className="field-error" role="alert">{current.message}</p>}
-        {runtime.statistics_status !== 'available' && <div className="inline-notice notice-warning"><Icon name="alert" /><span>Счётчики runtime недоступны. Для контейнеров со старой версией runner нужен повторный деплой; значения API не подставляются.</span></div>}
+        {runtime.status !== 'stopped' && runtime.statistics_status !== 'available' && <div className="inline-notice notice-warning"><Icon name="alert" /><span>Счётчики runtime недоступны. Для контейнеров со старой версией runner нужен повторный деплой; значения API не подставляются.</span></div>}
         <div className="runtime-table-head"><span>Модель / версия</span><span>Запросы</span><span>Успешно</span><span>Ошибки</span><span>В работе</span><span>Среднее время</span><span>Действие</span></div>
         {runtime.models.map(model => <div className={`runtime-model-row ${selectedModel === model.id ? 'row-selected' : ''}`} key={`${model.id}:${model.version}`}>
-          <div className="runtime-model-name"><strong>{model.id}</strong><span className="mono">v{model.version}</span></div>
+          <div className="runtime-model-name"><strong>{model.id}</strong><span className="mono">v{model.version} · {model.enabled === false ? 'Неактивна' : runtime.status === 'stopped' ? 'Контейнер выключен' : 'Активна'}</span></div>
           <Metric label="Запросы" value={number(model.requests?.total)} />
           <Metric label="Успешно" value={number(model.requests?.completed)} />
           <Metric label="Ошибки" value={number(model.requests?.failed)} />
           <Metric label="В работе" value={number(model.requests?.in_progress)} />
           <Metric label="Среднее время" value={model.requests?.average_latency_ms == null ? '—' : `${number(model.requests.average_latency_ms)} мс`} />
-          <button type="button" className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button>
+          <div className="model-controls"><button type="button" className="text-button" disabled={!!pending || runtime.status === 'stopped'} onClick={() => void act('models', model.id, model.enabled === false ? 'start' : 'stop')}>{model.enabled === false ? 'Активировать' : 'Деактивировать'}</button><button type="button" className="text-button" disabled={!!pending} onClick={() => void act('models', model.id, 'redeploy')}>Редеплой</button><button type="button" disabled={!!pending || model.enabled === false || runtime.status === 'stopped'} className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button></div>
         </div>)}
       </article>;
     })}</div>}

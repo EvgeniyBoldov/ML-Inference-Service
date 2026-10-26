@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import perf_counter, time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Request
@@ -190,6 +190,14 @@ def create_app(
     @app.get("/internal/v1/runtimes")
     async def list_runtimes(_: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
         return await manager.runtime_inventory()
+
+    @app.post("/internal/v1/runtimes/{runtime_id}/{action}")
+    async def runtime_action(runtime_id: str, action: Literal["start", "stop", "redeploy"], _: None = Depends(auth.require("deployment.write"))) -> dict[str, Any]:
+        return await manager.lifecycle(runtime_id, action)
+
+    @app.post("/internal/v1/models/{model}/{action}")
+    async def model_action(model: str, action: Literal["start", "stop", "redeploy"], _: None = Depends(auth.require("deployment.write"))) -> dict[str, Any]:
+        return await manager.lifecycle(model, action, model=True)
 
     @app.get("/internal/v1/runtimes/{runtime_id}/health")
     async def runtime_health(runtime_id: str, _: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:

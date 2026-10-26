@@ -152,3 +152,32 @@ synchronous model call already running in a thread. Runtime admission limits fur
 calls while its existing predictions execute. Apply the fleet memory/CPU settings
 and provision models that are safe for concurrent prediction. The in-process backend
 is intended for development.
+
+Управление моделями и контейнерами доступно на панели «Контейнеры и модели».
+Деактивация модели отключает её маршрут inference, сохраняя модель в памяти
+общего контейнера. Запуск контейнера сохраняет индивидуальные настройки
+активации моделей. Выключенные группы остаются в панели после перезапуска API.
+Остановка контейнера прекращает новые запросы, дожидается выполняющихся и
+удаляет Docker-контейнер; включение создаёт контейнер из сохранённых метаданных
+и закреплённого образа без обращения к MLflow.
+
+Для токена с `deployment.write` доступны операции:
+
+- `POST /internal/v1/models/{model}/stop` — деактивировать модель;
+- `POST /internal/v1/models/{model}/start` — активировать модель в работающем контейнере;
+- `POST /internal/v1/models/{model}/redeploy` — повторно получить текущую версию из MLflow;
+- `POST /internal/v1/runtimes/{runtime_id}/stop` — выключить контейнер;
+- `POST /internal/v1/runtimes/{runtime_id}/start` — включить выключенную группу;
+- `POST /internal/v1/runtimes/{runtime_id}/redeploy` — повторно получить все версии группы из MLflow.
+
+Операции синхронные: `200 {"status":"completed"}` означает завершение.
+Редеплой сохраняет номера версий и настройки активации моделей, запускает группу
+и переключает маршруты после healthcheck и warmup. Для смены версии используется
+обычный deployment API. Поскольку модели делят один процесс, редеплой модели
+пересоздаёт её группу; при изменении producer image группа разделяется по образам.
+Старые runtime удаляются по `PREVIOUS_RUNTIME_TTL_SECONDS`; rollback через
+предыдущий deployment после ручного изменения состава/состояния недоступен.
+После запуска/редеплоя следует обновить inventory: runtime ID может измениться.
+
+Перед запуском обновлённого API примените миграцию `alembic upgrade head`
+(ревизия `0003_lifecycle`).

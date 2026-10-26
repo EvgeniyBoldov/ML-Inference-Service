@@ -148,13 +148,13 @@ class DeploymentManager:
 
             deployment.status = DeploymentStatus.LOADING
             await self._repository.save(deployment)
-            current = await self._repository.list_active()
+            current = await self._repository.list_managed()
             if any(item.metadata is None for item in current):
                 raise ServiceError("RUNTIME_UNAVAILABLE", "Active fleet metadata is incomplete", status_code=503)
             if current and self._active_snapshot is None:
                 raise ServiceError("RUNTIME_UNAVAILABLE", "Active runtime groups have not been restored", status_code=503)
             producer_image = await self._runtime.resolve_image(metadata.producer_image)
-            group = [item for item in current if item.model != deployment.model and item.runtime_image == producer_image]
+            group = [item for item in current if item.model != deployment.model and item.runtime_image == producer_image and item.runtime_enabled]
             group_models = [item.metadata for item in group if item.metadata]
             group_models.append(metadata)
             runtime = await self._runtime.deploy(group_models, image=producer_image)
@@ -250,6 +250,105 @@ class DeploymentManager:
             except Exception:
                 self._logger.exception("candidate_cleanup_failed", extra={"runtime_id": runtime.id})
 
+    async def lifecycle(self, identity: str, action: str, *, model: bool = False) -> dict[str, Any]:
+        """Serialize operator changes with rollouts; publish only validated candidates."""
+        async with self._rollout_lock:
+            if self._closing or self._reconciliation_required:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Fleet is unavailable for changes", status_code=503)
+            snapshot = self._active_snapshot
+            if snapshot is None:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Fleet has not been restored", status_code=503)
+            selected = [item for item in snapshot.deployments.values() if (item.model == identity if model else item.runtime_id == identity)]
+            if not selected:
+                raise ServiceError("MODEL_NOT_FOUND" if model else "RUNTIME_NOT_FOUND", "Managed model or runtime was not found", status_code=404)
+            if model and action in {"start", "stop"}:
+                if action == "start" and not selected[0].runtime_enabled:
+                    raise ServiceError("RUNTIME_STOPPED", "Start the container before activating its model", status_code=409)
+                if action == "start":
+                    handle = snapshot.runtimes.get(selected[0].runtime_id or "")
+                    if handle is None or not await asyncio.wait_for(self._runtime.health(handle), timeout=3):
+                        raise ServiceError("RUNTIME_UNAVAILABLE", "Model runtime is unhealthy", status_code=503)
+                updated = [replace(item, enabled=action == "start") for item in selected]
+                await self._publish_lifecycle(snapshot, updated, dict(snapshot.runtimes))
+            elif action == "stop":
+                updated = [replace(item, runtime_enabled=False) for item in selected]
+                runtimes = dict(snapshot.runtimes)
+                handle = runtimes.pop(identity, None) or self._runtime_handles.get(identity)
+                if handle is None:
+                    handle = RuntimeHandle(identity, {item.model: item.metadata for item in selected if item.metadata}, selected[0].runtime_image)
+                await self._publish_lifecycle(snapshot, updated, runtimes)
+                if handle:
+                    async with self._idle:
+                        await self._idle.wait_for(lambda: self._inflight.get(identity, 0) == 0)
+                    await asyncio.wait_for(self._runtime.stop(handle), timeout=30)
+                    self._runtime_handles.pop(identity, None)
+            else:
+                if action == "start" and all(item.runtime_enabled for item in selected) and identity in snapshot.runtimes:
+                    if await asyncio.wait_for(self._runtime.health(snapshot.runtimes[identity]), timeout=3):
+                        return {"status": "completed"}
+                # A single model rollout rebuilds its shared group, retaining its neighbours.
+                members = [item for item in snapshot.deployments.values() if item.runtime_id == selected[0].runtime_id]
+                resolved = []
+                for item in members:
+                    metadata = item.metadata
+                    refresh = action == "redeploy" and (not model or item.model == identity)
+                    if refresh:
+                        metadata = await asyncio.wait_for(self._source.resolve(item.model, item.uri), timeout=120)
+                        _validate_metadata(metadata, item)
+                    if metadata is None:
+                        raise ServiceError("RUNTIME_UNAVAILABLE", "Model metadata is missing", status_code=503)
+                    image = await self._runtime.resolve_image(metadata.producer_image) if refresh else item.runtime_image
+                    resolved.append(replace(item, metadata=metadata, runtime_image=image, runtime_enabled=True))
+                candidates: dict[str, RuntimeHandle] = {}
+                updated = []
+                try:
+                    groups: dict[str | None, list[Deployment]] = {}
+                    for item in resolved:
+                        groups.setdefault(item.runtime_image, []).append(item)
+                    for image, group in groups.items():
+                        handle = await self._runtime.deploy([item.metadata for item in group], image=image)
+                        candidates[handle.id] = handle
+                        await asyncio.wait_for(self._runtime.load(handle), timeout=240)
+                        if not await asyncio.wait_for(self._runtime.health(handle), timeout=3):
+                            raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Runtime healthcheck failed", status_code=502)
+                        for item in group:
+                            warmup = getattr(self._runtime, "warmup", self._runtime.predict)
+                            output = await asyncio.wait_for(warmup(handle, item.model, item.metadata.input_example), timeout=30)
+                            _validate_output(item.metadata.output_schema, output)
+                            json.dumps(output, allow_nan=False)
+                            updated.append(replace(item, runtime_id=handle.id, runtime_image=handle.image))
+                except BaseException:
+                    for handle in candidates.values():
+                        await self._stop_failed_candidate(handle)
+                    raise
+                runtimes = dict(snapshot.runtimes)
+                runtimes.pop(selected[0].runtime_id, None)
+                runtimes.update(candidates)
+                await self._publish_lifecycle(snapshot, updated, runtimes)
+                self._runtime_handles.update(candidates)
+                self._schedule_snapshot_expiry(snapshot)
+            return {"status": "completed"}
+
+    async def _publish_lifecycle(self, snapshot: FleetSnapshot, updated: list[Deployment], runtimes: dict[str, RuntimeHandle]) -> None:
+        # A lost COMMIT response is ambiguous; retain candidates for reconciliation.
+        try:
+            await self._repository.update_fleet(updated)
+        except BaseException:
+            self._reconciliation_required = True
+            raise
+        deployments = dict(snapshot.deployments)
+        deployments.update({item.model: item for item in updated})
+        async with self._fleet_lock:
+            self._active_snapshot = FleetSnapshot(runtimes, deployments)
+            previous = self._previous_snapshot
+            self._previous_snapshot = None
+        if previous:
+            self._schedule_snapshot_expiry(previous)
+        for item in updated:
+            active = int(item.enabled and item.runtime_enabled)
+            self._metrics.active_version.labels(item.model, item.version).set(active)
+            self._metrics.runtime_status.labels(item.model, item.version, "active").set(active)
+
     async def active(self, model: str) -> tuple[Deployment, RuntimeHandle]:
         if self._reconciliation_required:
             raise ServiceError("RUNTIME_UNAVAILABLE", "Fleet state requires recovery", status_code=503)
@@ -260,7 +359,7 @@ class DeploymentManager:
                 raise ServiceError("MODEL_NOT_FOUND", f"Model '{model}' is not active", status_code=404, param="model")
             raise ServiceError("RUNTIME_UNAVAILABLE", "Active model runtime is unavailable", status_code=503)
         deployment = snapshot.deployments.get(model)
-        if deployment is None:
+        if deployment is None or not deployment.enabled or not deployment.runtime_enabled:
             raise ServiceError("MODEL_NOT_FOUND", f"Model '{model}' is not active", status_code=404, param="model")
         runtime = snapshot.runtimes.get(deployment.runtime_id or "")
         if runtime is None:
@@ -284,17 +383,17 @@ class DeploymentManager:
         return await self._repository.list_active()
 
     async def runtime_inventory(self, runtime_id: str | None = None, *, include_statistics: bool = True) -> dict[str, Any]:
-        """Describe active runtime groups and read counters from the model processes."""
+        """Describe managed groups, including stopped containers and inactive models."""
         async with self._fleet_lock:
             snapshot = self._active_snapshot
-        deployments = list(snapshot.deployments.values()) if snapshot else await self._repository.list_active()
+        deployments = list(snapshot.deployments.values()) if snapshot else await self._repository.list_managed()
         groups: dict[str, list[Deployment]] = {}
         for deployment in deployments:
             identity = deployment.runtime_id or f"missing-{deployment.id}"
             groups.setdefault(identity, []).append(deployment)
         if runtime_id is not None:
             if runtime_id not in groups:
-                raise ServiceError("RUNTIME_NOT_FOUND", "Active runtime was not found", status_code=404, param="runtime_id")
+                raise ServiceError("RUNTIME_NOT_FOUND", "Managed runtime was not found", status_code=404, param="runtime_id")
             groups = {runtime_id: groups[runtime_id]}
         capacity = asyncio.Semaphore(8)
 
@@ -303,6 +402,8 @@ class DeploymentManager:
             kind = getattr(self._runtime, "kind", "runtime")
 
             async def health() -> str:
+                if not members[0].runtime_enabled:
+                    return "stopped"
                 if handle is None:
                     return "unavailable"
                 try:
@@ -332,6 +433,7 @@ class DeploymentManager:
                 models.append({
                     "id": deployment.model, "version": deployment.version,
                     "deployment_id": deployment.id,
+                    "enabled": deployment.enabled, "runtime_enabled": deployment.runtime_enabled,
                     "requests": {key: measurement.get(key) for key in (*required, "average_latency_ms")} if measurement else None,
                 })
             return {
@@ -359,7 +461,7 @@ class DeploymentManager:
             ready = False
         return {
             "status": "ready" if ready and not self._closing else "degraded",
-            "active_models": len(self._active_snapshot.deployments) if self._active_snapshot else 0,
+            "active_models": sum(item.enabled and item.runtime_enabled for item in self._active_snapshot.deployments.values()) if self._active_snapshot else 0,
             "pending_deployments": self._pending_deployments + self._recovering_deployments,
             "recovery_required": self._reconciliation_required,
         }
@@ -389,7 +491,10 @@ class DeploymentManager:
         MLflow control plane. Any handle that cannot be recreated remains absent
         and requests fail safely with ``RUNTIME_UNAVAILABLE``.
         """
-        active = await self._repository.list_active()
+        managed = await self._repository.list_managed()
+        active = [item for item in managed if item.runtime_enabled]
+        if not active:
+            self._active_snapshot = FleetSnapshot({}, {item.model: item for item in managed})
         if active and all(item.metadata and item.runtime_id and item.runtime_image for item in active):
             try:
                 groups: dict[str, list[Deployment]] = {}
@@ -413,7 +518,7 @@ class DeploymentManager:
                         _validate_output(item.metadata.output_schema, output)
                     runtimes[runtime_id] = runtime
                 self._runtime_handles.update(runtimes)
-                self._active_snapshot = FleetSnapshot(runtimes, {item.model: item for item in active})
+                self._active_snapshot = FleetSnapshot(runtimes, {item.model: item for item in managed})
             except Exception:
                 self._logger.exception("fleet_restore_failed", extra={"models": [item.model for item in active]})
         incomplete = await self._repository.list_incomplete()

@@ -48,6 +48,8 @@ class Deployment:
     runtime_id: str | None = None
     runtime_image: str | None = None
     created_at: int = field(default_factory=lambda: int(time()))
+    enabled: bool = True
+    runtime_enabled: bool = True
     activated_at: int | None = None
     failed_at: int | None = None
     error_code: str | None = None

@@ -76,3 +76,27 @@ async def test_activation_and_rollback_persist_the_complete_fleet(repository):
     async with repository._sessions() as session:
         rows = (await session.scalars(select(DeploymentRow).where(DeploymentRow.id.in_([first.id, upgrade.id])))).all()
         assert {row.id: row.status for row in rows} == {first.id: "active", upgrade.id: "standby"}
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_updates_are_atomic_and_survive_new_repository(repository):
+    credit = candidate("lifecycle-credit", model="lifecycle-credit", runtime="lifecycle-group")
+    churn = candidate("lifecycle-churn", model="lifecycle-churn", runtime="lifecycle-group")
+    for item in (credit, churn):
+        await repository.create_or_get(item, item.id, item.id)
+        await repository.activate(item)
+    disabled = replace(credit, enabled=False, runtime_enabled=False)
+    stopped = replace(churn, runtime_enabled=False)
+    with pytest.raises(LookupError):
+        await repository.update_fleet([disabled, candidate("lifecycle-missing")])
+    assert (await repository.get(credit.id)).enabled
+    await repository.update_fleet([disabled, stopped])
+    other = SqlAlchemyDeploymentRepository(os.environ["INFERENCE_TEST_DATABASE_URL"])
+    try:
+        managed = {item.model: item for item in await other.list_managed()}
+        assert not managed[credit.model].enabled
+        assert managed[churn.model].enabled
+        assert not managed[churn.model].runtime_enabled
+        assert not {credit.model, churn.model} & {item.model for item in await other.list_active()}
+    finally:
+        await other.dispose()

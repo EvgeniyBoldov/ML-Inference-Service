@@ -10,7 +10,7 @@ export function runtimeTotals(runtimes) {
   return result;
 }
 
-export const runtimeStateLabel = state => ({ healthy: 'Отвечает', unhealthy: 'Не отвечает', unavailable: 'Недоступен', checking: 'Проверка…' })[state] || 'Нет проверки';
+export const runtimeStateLabel = state => ({ stopped: 'Выключен', healthy: 'Отвечает', unhealthy: 'Не отвечает', unavailable: 'Недоступен', checking: 'Проверка…' })[state] || 'Нет проверки';
 export const checkedAt = timestamp => timestamp ? new Date(timestamp * 1000).toLocaleTimeString('ru-RU') : '—';
 
 export function countLabel(value, one, few, many) {

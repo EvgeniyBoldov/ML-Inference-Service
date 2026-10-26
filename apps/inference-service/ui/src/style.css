@@ -215,7 +215,7 @@ input:disabled, select:disabled, textarea:disabled { background: #f9f9fc; color:
 .health-checking { color: #9c7d3b; }
 .runtime-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 16px 0; color: #858b9c; font-size: 11px; }
 .runtime-summary strong { color: #5e667b; font-weight: 600; }
-.runtime-table-head, .runtime-model-row { display: grid; grid-template-columns: minmax(150px, 1.8fr) repeat(4, minmax(55px, .7fr)) minmax(80px, 1fr) 70px; align-items: center; gap: 14px; }
+.runtime-table-head, .runtime-model-row { display: grid; grid-template-columns: minmax(150px, 1.8fr) repeat(4, minmax(55px, .7fr)) minmax(80px, 1fr) 140px; align-items: center; gap: 14px; }
 .runtime-table-head { padding: 10px 0; border-top: 1px solid #edeef4; border-bottom: 1px solid #edeef4; color: #8b90a1; font-size: 10px; }
 .runtime-model-row { padding: 14px 0; border-bottom: 1px solid #f0f1f6; }
 .runtime-model-row:last-child { border-bottom: 0; }
@@ -270,3 +270,7 @@ input:disabled, select:disabled, textarea:disabled { background: #f9f9fc; color:
   .runtime-identity { gap: 8px; }
   .monitor-card { padding: 15px; }
 }
+
+.model-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+button:disabled { cursor: default; opacity: .5; }
+.health-stopped { color: #667085; }

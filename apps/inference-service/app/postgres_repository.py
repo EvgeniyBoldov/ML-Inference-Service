@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from hashlib import sha256
 
-from sqlalchemy import BigInteger, JSON, String, select, text
+from sqlalchemy import BigInteger, Boolean, JSON, String, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -30,6 +30,8 @@ class DeploymentRow(Base):
     runtime_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     runtime_image: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    runtime_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     activated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     failed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -95,7 +97,7 @@ class SqlAlchemyDeploymentRepository:
             replacement = _to_row(deployment)
             for field in (
                 "model", "version", "uri", "slot", "status", "metadata_json", "runtime_id", "runtime_image", "created_at",
-                "activated_at", "failed_at", "error_code", "error_message",
+                "activated_at", "failed_at", "error_code", "error_message", "enabled", "runtime_enabled",
             ):
                 setattr(row, field, getattr(replacement, field))
 
@@ -107,7 +109,20 @@ class SqlAlchemyDeploymentRepository:
             row = await session.get(DeploymentRow, route.active_deployment_id)
             return _from_row(row) if row else None
 
+    async def update_fleet(self, deployments: list[Deployment]) -> None:
+        async with self._sessions.begin() as session:
+            for item in deployments:
+                row = await session.get(DeploymentRow, item.id, with_for_update=True)
+                if row is None:
+                    raise LookupError("Fleet deployment was not found")
+                replacement = _to_row(item)
+                for field in ("metadata_json", "runtime_id", "runtime_image", "enabled", "runtime_enabled"):
+                    setattr(row, field, getattr(replacement, field))
+
     async def list_active(self) -> list[Deployment]:
+        return [item for item in await self.list_managed() if item.enabled and item.runtime_enabled]
+
+    async def list_managed(self) -> list[Deployment]:
         async with self._sessions() as session:
             rows = (await session.scalars(select(DeploymentRow).join(RouteRow, RouteRow.active_deployment_id == DeploymentRow.id))).all()
             return [_from_row(row) for row in rows]
@@ -185,7 +200,8 @@ def _to_row(deployment: Deployment) -> DeploymentRow:
     return DeploymentRow(
         id=deployment.id, model=deployment.model, version=deployment.version, uri=deployment.uri, slot=deployment.slot,
         status=deployment.status.value, metadata_json=_metadata_to_json(deployment.metadata), runtime_id=deployment.runtime_id, runtime_image=deployment.runtime_image,
-        created_at=deployment.created_at, activated_at=deployment.activated_at, failed_at=deployment.failed_at,
+        created_at=deployment.created_at, enabled=deployment.enabled, runtime_enabled=deployment.runtime_enabled,
+        activated_at=deployment.activated_at, failed_at=deployment.failed_at,
         error_code=deployment.error_code, error_message=deployment.error_message,
     )
 
@@ -194,6 +210,7 @@ def _from_row(row: DeploymentRow) -> Deployment:
     return Deployment(
         id=row.id, model=row.model, version=row.version, uri=row.uri, slot=row.slot, status=DeploymentStatus(row.status),
         metadata=_metadata_from_json(row.metadata_json), runtime_id=row.runtime_id, runtime_image=row.runtime_image, created_at=row.created_at,
+        enabled=row.enabled, runtime_enabled=row.runtime_enabled,
         activated_at=row.activated_at, failed_at=row.failed_at, error_code=row.error_code, error_message=row.error_message,
     )
 
