@@ -54,13 +54,13 @@ export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect
         {runtime.status !== 'stopped' && runtime.statistics_status !== 'available' && <div className="inline-notice notice-warning"><Icon name="alert" /><span>Счётчики runtime недоступны. Для контейнеров со старой версией runner нужен повторный деплой; значения API не подставляются.</span></div>}
         <div className="runtime-table-head"><span>Модель / версия</span><span>Запросы</span><span>Успешно</span><span>Ошибки</span><span>В работе</span><span>Среднее время</span><span>Действие</span></div>
         {runtime.models.map(model => <div className={`runtime-model-row ${selectedModel === model.id ? 'row-selected' : ''}`} key={`${model.id}:${model.version}`}>
-          <div className="runtime-model-name"><strong>{model.id}</strong><span className="mono">v{model.version} · {model.enabled === false ? 'Неактивна' : runtime.status === 'stopped' ? 'Контейнер выключен' : 'Активна'}</span></div>
+          <div className="runtime-model-name"><strong>{model.id}</strong><span className="mono">v{model.version} · {model.enabled === false ? 'Остановлена' : runtime.status === 'stopped' ? 'Контейнер выключен' : 'Активна'}</span></div>
           <Metric label="Запросы" value={number(model.requests?.total)} />
           <Metric label="Успешно" value={number(model.requests?.completed)} />
           <Metric label="Ошибки" value={number(model.requests?.failed)} />
           <Metric label="В работе" value={number(model.requests?.in_progress)} />
           <Metric label="Среднее время" value={model.requests?.average_latency_ms == null ? '—' : `${number(model.requests.average_latency_ms)} мс`} />
-          <div className="model-controls"><button type="button" className="text-button" disabled={!!pending || runtime.status === 'stopped'} onClick={() => void act('models', model.id, model.enabled === false ? 'start' : 'stop')}>{model.enabled === false ? 'Активировать' : 'Деактивировать'}</button><button type="button" className="text-button" disabled={!!pending} onClick={() => void act('models', model.id, 'redeploy')}>Редеплой</button><button type="button" disabled={!!pending || model.enabled === false || runtime.status === 'stopped'} className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button></div>
+          <div className="model-controls"><button type="button" className="text-button" disabled={!!pending || runtime.status === 'stopped'} onClick={() => void act('models', model.id, model.enabled === false ? 'start' : 'stop')}>{model.enabled === false ? 'Запустить' : 'Остановить'}</button><button type="button" className="text-button" disabled={!!pending} onClick={() => void act('models', model.id, 'redeploy')}>Редеплой</button><button type="button" disabled={!!pending || model.enabled === false || runtime.status === 'stopped'} className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button></div>
         </div>)}
       </article>;
     })}</div>}
