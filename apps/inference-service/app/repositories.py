@@ -26,6 +26,7 @@ class DeploymentRepository(Protocol):
     async def list_active(self) -> list[Deployment]: ...
     async def list_managed(self) -> list[Deployment]: ...
     async def update_fleet(self, deployments: list[Deployment]) -> None: ...
+    async def delete_model(self, model: str, fleet: list[Deployment]) -> bool: ...
     async def list_recoverable(self) -> list[Deployment]: ...
     async def list_incomplete(self) -> list[Deployment]: ...
     async def activate(self, candidate: Deployment, fleet: list[Deployment] | None = None) -> Deployment | None: ...
@@ -80,6 +81,22 @@ class InMemoryDeploymentRepository:
 
     async def list_active(self) -> list[Deployment]:
         return [item for item in await self.list_managed() if item.enabled and item.runtime_enabled]
+
+    async def delete_model(self, model: str, fleet: list[Deployment]) -> bool:
+        """Forget all versions, routing and idempotency keys in one transaction."""
+        async with self.lock:
+            identities = {item.id for item in self._deployments.values() if item.model == model}
+            if not identities:
+                return False
+            if any(item.id not in self._deployments or item.model == model for item in fleet):
+                raise LookupError("Fleet deployment was not found")
+            for item in fleet:
+                self._deployments[item.id] = deepcopy(item)
+            self._routes.pop(model, None)
+            self._idempotency = {key: value for key, value in self._idempotency.items() if value[0] not in identities}
+            for identity in identities:
+                del self._deployments[identity]
+            return True
 
     async def list_managed(self) -> list[Deployment]:
         async with self.lock:

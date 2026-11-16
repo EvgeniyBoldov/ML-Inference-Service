@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from hashlib import sha256
 
-from sqlalchemy import BigInteger, Boolean, JSON, String, select, text
+from sqlalchemy import BigInteger, Boolean, JSON, String, delete, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -121,6 +121,22 @@ class SqlAlchemyDeploymentRepository:
 
     async def list_active(self) -> list[Deployment]:
         return [item for item in await self.list_managed() if item.enabled and item.runtime_enabled]
+
+    async def delete_model(self, model: str, fleet: list[Deployment]) -> bool:
+        async with self._sessions.begin() as session:
+            identities = select(DeploymentRow.id).where(DeploymentRow.model == model)
+            if not (await session.scalars(identities)).first():
+                return False
+            for item in fleet:
+                row = await session.get(DeploymentRow, item.id, with_for_update=True)
+                if row is None or row.model == model:
+                    raise LookupError("Fleet deployment was not found")
+                row.runtime_id = item.runtime_id
+                row.runtime_image = item.runtime_image
+            await session.execute(delete(RouteRow).where(RouteRow.model == model))
+            await session.execute(delete(IdempotencyRow).where(IdempotencyRow.deployment_id.in_(identities)))
+            await session.execute(delete(DeploymentRow).where(DeploymentRow.model == model))
+            return True
 
     async def list_managed(self) -> list[Deployment]:
         async with self._sessions() as session:

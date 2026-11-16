@@ -100,3 +100,36 @@ async def test_lifecycle_updates_are_atomic_and_survive_new_repository(repositor
         assert not {credit.model, churn.model} & {item.model for item in await other.list_active()}
     finally:
         await other.dispose()
+
+
+@pytest.mark.asyncio
+async def test_delete_model_atomically_removes_all_versions_routes_and_keys(repository):
+    from app.postgres_repository import IdempotencyRow, RouteRow
+
+    first = candidate("delete-credit-1", model="delete-credit")
+    second = candidate("delete-credit-2", model="delete-credit", version="2")
+    failed = replace(candidate("delete-credit-failed", model="delete-credit", version="3"), status=DeploymentStatus.FAILED)
+    neighbour = candidate("delete-neighbour", model="delete-neighbour")
+    for item in (first, second, failed, neighbour):
+        await repository.create_or_get(item, item.id, item.id)
+    await repository.activate(first)
+    await repository.activate(second)
+    await repository.activate(neighbour)
+    with pytest.raises(LookupError):
+        await repository.delete_model(first.model, [replace(neighbour, runtime_id="replacement"), candidate("delete-missing")])
+    assert (await repository.active_for(first.model)).id == second.id
+    assert (await repository.get(neighbour.id)).runtime_id == neighbour.runtime_id
+    assert await repository.delete_model(first.model, [replace(neighbour, runtime_id="replacement")])
+    assert not await repository.delete_model(first.model, [])
+    assert await repository.active_for(first.model) is None
+    for item in (first, second, failed):
+        assert await repository.get(item.id) is None
+    assert (await repository.active_for(neighbour.model)).runtime_id == "replacement"
+    async with repository._sessions() as session:
+        assert await session.get(RouteRow, first.model) is None
+        for item in (first, second, failed):
+            assert await session.get(IdempotencyRow, item.id) is None
+        assert await session.get(IdempotencyRow, neighbour.id) is not None
+    fresh, created = await repository.create_or_get(candidate("delete-credit-fresh", model=first.model), first.id, "new-fingerprint")
+    assert created
+    assert fresh.id == "delete-credit-fresh"

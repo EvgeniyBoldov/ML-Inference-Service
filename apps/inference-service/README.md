@@ -32,6 +32,8 @@ The producer-side MLflow and Airflow contract used by this application lives in
 The initial FastAPI implementation is available in `app/main.py`:
 
 - OpenAI-style `GET /v1/models`, `GET /v1/models/{model}`, and `POST /v1/responses`;
+- `POST /v1/test/predict` accepts `{"input": <any JSON value>}` and returns a
+  test response without MLflow or a deployed model; requires a `predict` token;
 - internal asynchronous deployment creation/status and rollback endpoints;
 - bearer token role checks, idempotency keys, JSON Schema input/output validation,
   OpenAI-style error envelopes, and atomic in-memory active/previous routing.
@@ -154,7 +156,7 @@ and provision models that are safe for concurrent prediction. The in-process bac
 is intended for development.
 
 Управление моделями и контейнерами доступно на панели «Контейнеры и модели».
-Деактивация модели отключает её маршрут inference, сохраняя модель в памяти
+Остановка модели блокирует новые запросы inference, сохраняя модель в памяти
 общего контейнера. Запуск контейнера сохраняет индивидуальные настройки
 активации моделей. Выключенные группы остаются в панели после перезапуска API.
 Остановка контейнера прекращает новые запросы, дожидается выполняющихся и
@@ -163,14 +165,24 @@ is intended for development.
 
 Для токена с `deployment.write` доступны операции:
 
-- `POST /internal/v1/models/{model}/stop` — деактивировать модель;
+- `POST /internal/v1/models/{model}/stop` — заблокировать новые запросы к модели;
 - `POST /internal/v1/models/{model}/start` — активировать модель в работающем контейнере;
 - `POST /internal/v1/models/{model}/redeploy` — повторно получить текущую версию из MLflow;
+- `DELETE /internal/v1/models/{model}` — удалить модель из сервиса, её маршрут, все записи деплоев и ключи идемпотентности;
 - `POST /internal/v1/runtimes/{runtime_id}/stop` — выключить контейнер;
 - `POST /internal/v1/runtimes/{runtime_id}/start` — включить выключенную группу;
 - `POST /internal/v1/runtimes/{runtime_id}/redeploy` — повторно получить все версии группы из MLflow.
 
 Операции синхронные: `200 {"status":"completed"}` означает завершение.
+Удаление возвращает `204` без тела, неизвестная модель — `404`.
+Удалить можно также остановленную модель или записи неудачного деплоя.
+В общем работающем контейнере сначала проверяется новый runtime с оставшимися
+моделями, затем переключаются маршруты; настройки их остановки сохраняются.
+Старые runtime удаляются после завершения выполняющихся запросов.
+Удаление сбрасывает возможность отката предыдущего состава fleet, чтобы откат
+соседней модели не вернул удалённую. Повторный деплой возможен с прежним ключом
+идемпотентности. Исходная модель и артефакты MLflow, журналы и исторические
+метрики сохраняются.
 Редеплой сохраняет номера версий и настройки активации моделей, запускает группу
 и переключает маршруты после healthcheck и warmup. Для смены версии используется
 обычный deployment API. Поскольку модели делят один процесс, редеплой модели

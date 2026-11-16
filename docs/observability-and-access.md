@@ -86,7 +86,7 @@ The file contains only SHA-256 hashes, one record per line:
 
 | Role | Permissions |
 | --- | --- |
-| `predict` | `GET /v1/models`, `GET /v1/models/{model}`, `POST /v1/responses` |
+| `predict` | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1/models/{model}/health`, `POST /v1/responses`, `POST /v1/test/predict` |
 | `deploy` | Internal deployment create/status/rollback, `GET /internal/v1/status` and `GET /metrics` |
 
 Create tokens on the production VM. The command prints a plaintext token only
@@ -109,3 +109,9 @@ sets it explicitly):
 ```dotenv
 INFERENCE_TOKEN_FILE=/etc/ml-inference-service/tokens
 ```
+
+The local stack in `infra/compose/local-inference.compose.yaml` explicitly sets
+`INFERENCE_TRUSTED_PROXY_AUTH=true`, bypassing service token checks. To enforce
+tokens there, set it to `false`, set `INFERENCE_TOKEN_FILE` to the container path
+of the token file, mount the host token directory read-only, and recreate the API
+container. `INFERENCE_TRUSTED_PROXY_AUTH=true` takes precedence over the token file.

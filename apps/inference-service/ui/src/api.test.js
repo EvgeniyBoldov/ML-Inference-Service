@@ -22,3 +22,12 @@ test('request cancellation distinguishes a timeout from changing the selected mo
   controller.abort();
   await assert.rejects(promise, { name: 'AbortError' });
 });
+
+test('model deletion accepts an empty 204 response', async t => {
+  t.mock.method(globalThis, 'fetch', async (path, options) => {
+    assert.equal(path, '/internal/v1/models/credit');
+    assert.equal(options.method, 'DELETE');
+    return new Response(null, { status: 204 });
+  });
+  assert.equal(await request('/internal/v1/models/credit', { method: 'DELETE' }), null);
+});

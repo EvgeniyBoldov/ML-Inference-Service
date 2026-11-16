@@ -21,6 +21,7 @@ export async function request(path, { timeout = 15000, signal, ...options } = {}
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new ApiError(body?.error?.message || `Сервис вернул ошибку ${response.status}`, response.status, body?.error?.code);
+    if (response.status === 204) return null;
     if (body === null) throw new Error('Сервис вернул некорректный ответ. Обновите страницу или проверьте подключение.');
     return body;
   } catch (error) {

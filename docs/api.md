@@ -21,6 +21,21 @@ never by fabricated zeroes or API counters.
 Status `predictions` and Prometheus prediction metrics remain API-side
 observations for existing consumers. General HTTP counters remain in `requests`.
 
+Model controls require `deployment.write`:
+
+- `POST /internal/v1/models/{model}/stop` blocks new predictions for a deployed
+  model without stopping its container or unloading it. In-flight requests finish.
+- `POST /internal/v1/models/{model}/start` allows predictions again; its container
+  must already be running. Both operations return `200 {"status":"completed"}`.
+- `DELETE /internal/v1/models/{model}` removes all deployment versions, its route
+  and associated idempotency keys, returning `204` with no body (`404` if absent).
+  Failed deployment records and stopped models can also be deleted. A shared
+  running group is rebuilt and validated with its remaining models before the
+  deletion commits. Their enabled flags are preserved. Retired runtimes stop
+  after in-flight predictions finish. Previous-fleet rollback is invalidated to
+  prevent restoring the deleted model. A subsequent deployment can reuse the
+  original idempotency key. MLflow artifacts, logs and historical metrics remain.
+
 All public endpoints use the `/v1` prefix and Bearer authentication by default.
 Deployments behind a trusted, authenticated ingress may set
 `INFERENCE_TRUSTED_PROXY_AUTH=true`; in that mode the service accepts requests
@@ -33,6 +48,7 @@ deployment and metrics endpoints.
 | `GET` | `/v1/models/{model}` | `inference.read` | Get discovery metadata for one active model |
 | `GET` | `/v1/models/{model}/health` | `inference.read` | Check the runtime health for one active model |
 | `POST` | `/v1/responses` | `inference.predict` | Run prediction against the current active version |
+| `POST` | `/v1/test/predict` | `inference.predict` | Return a test prediction without MLflow or a deployed model |
 | `GET` | `/health/live` | — | Process liveness |
 | `GET` | `/health/ready` | — | Readiness for inference traffic |
 
@@ -51,6 +67,26 @@ The response identifies the actual model version that served the request:
 ```json
 {"id":"resp_...","object":"response","created_at":1787750100,"status":"completed","model":"credit-scoring","model_version":"18","output":[{"type":"prediction","content":{}}]}
 ```
+
+### Test prediction
+
+`POST /v1/test/predict` accepts `{"input": <any JSON value>}` and requires a
+`predict` token. The `input` field is required; `null` is accepted. It returns
+the standard response envelope with `model: "test-model"`, `model_version: "1"`
+and `output: [{"type":"prediction","content":{"prediction":"test-response","input":<submitted input>}}]`.
+The response ID and timestamp are generated for each request. No model deployment
+or MLflow connection is needed. This endpoint uses the service's HTTP metrics;
+it does not count as an invocation of a deployed model.
+
+```bash
+curl --fail-with-body "$INFERENCE_URL/v1/test/predict" \
+  -H "Authorization: Bearer $PREDICT_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"input":{"text":"hello"}}'
+```
+
+Create the token with `sudo bash scripts/manage-inference-token.sh create predict`
+on the service VM; see [token administration](observability-and-access.md#two-token-groups).
 
 ## Internal deployment API
 

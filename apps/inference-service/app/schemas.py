@@ -41,6 +41,10 @@ class ResponseRequest(BaseModel):
     input: Any
 
 
+class TestPredictionRequest(BaseModel):
+    input: Any
+
+
 class PredictionOutput(BaseModel):
     type: Literal["prediction"] = "prediction"
     content: Any

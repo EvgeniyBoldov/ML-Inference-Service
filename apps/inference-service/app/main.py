@@ -28,7 +28,7 @@ from .repositories import DeploymentRepository, InMemoryDeploymentRepository
 from .runtime import DockerFleetRuntimeBackend, PredictorRuntimeBackend, RuntimeBackend
 from .schemas import (
     DeploymentObject, DeploymentRequest, ErrorResponse, ModelList, ModelObject,
-    PredictionOutput, ResponseObject, ResponseRequest,
+    PredictionOutput, ResponseObject, ResponseRequest, TestPredictionRequest,
 )
 from .services import DeploymentManager, PredictionService
 
@@ -199,6 +199,11 @@ def create_app(
     async def model_action(model: str, action: Literal["start", "stop", "redeploy"], _: None = Depends(auth.require("deployment.write"))) -> dict[str, Any]:
         return await manager.lifecycle(model, action, model=True)
 
+    @app.delete("/internal/v1/models/{model}", status_code=204)
+    async def delete_model(model: str, _: None = Depends(auth.require("deployment.write"))) -> Response:
+        await manager.delete_model(model)
+        return Response(status_code=204)
+
     @app.get("/internal/v1/runtimes/{runtime_id}/health")
     async def runtime_health(runtime_id: str, _: None = Depends(auth.require("metrics.read"))) -> dict[str, Any]:
         inventory = await manager.runtime_inventory(runtime_id, include_statistics=False)
@@ -218,6 +223,15 @@ def create_app(
             "model": model,
             "version": deployment.version,
         }
+
+    @app.post("/v1/test/predict", response_model=ResponseObject, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
+    async def test_predict(body: TestPredictionRequest, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:
+        """Return a deterministic test prediction without provisioning a model runtime."""
+        return ResponseObject(
+            id=f"resp_{uuid4().hex}", created_at=int(time()),
+            model="test-model", model_version="1",
+            output=[PredictionOutput(content={"prediction": "test-response", "input": body.input})],
+        )
 
     @app.post("/v1/responses", response_model=ResponseObject, responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}})
     async def response(body: ResponseRequest, request: Request, _: None = Depends(auth.require("inference.predict"))) -> ResponseObject:

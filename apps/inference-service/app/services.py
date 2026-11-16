@@ -131,7 +131,7 @@ class DeploymentManager:
 
     async def _run(self, deployment: Deployment) -> None:
         async with self._rollout_lock:
-            if self._reconciliation_required:
+            if self._reconciliation_required or await self._repository.get(deployment.id) is None:
                 return
             await self._run_serialized(deployment)
 
@@ -249,6 +249,76 @@ class DeploymentManager:
                 await asyncio.wait_for(self._runtime.stop(runtime), timeout=30)
             except Exception:
                 self._logger.exception("candidate_cleanup_failed", extra={"runtime_id": runtime.id})
+
+    async def delete_model(self, model: str) -> None:
+        # Admission is paused until the deletion commits. Already queued work
+        # checks whether its deployment still exists after acquiring rollout.
+        async with self._admission_lock, self._rollout_lock:
+            if self._closing or self._reconciliation_required:
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Fleet is unavailable for changes", status_code=503)
+            snapshot = self._active_snapshot
+            if snapshot is None and await self._repository.list_managed():
+                raise ServiceError("RUNTIME_UNAVAILABLE", "Fleet has not been restored", status_code=503)
+            snapshot = snapshot or FleetSnapshot({}, {})
+            selected = snapshot.deployments.get(model)
+            updated = []
+            candidate = None
+            # Rebuild a shared running container without the deleted model.
+            # Stopped groups will load only their remaining members on start.
+            members = [item for item in snapshot.deployments.values()
+                       if selected and item.model != model and item.runtime_id == selected.runtime_id]
+            try:
+                if selected and selected.runtime_enabled and members:
+                    if any(item.metadata is None for item in members):
+                        raise ServiceError("RUNTIME_UNAVAILABLE", "Model metadata is missing", status_code=503)
+                    candidate = await self._runtime.deploy([item.metadata for item in members], image=selected.runtime_image)
+                    await asyncio.wait_for(self._runtime.load(candidate), timeout=240)
+                    if not await asyncio.wait_for(self._runtime.health(candidate), timeout=3):
+                        raise ServiceError("MODEL_HEALTHCHECK_FAILED", "Runtime healthcheck failed", status_code=502)
+                    for item in members:
+                        warmup = getattr(self._runtime, "warmup", self._runtime.predict)
+                        output = await asyncio.wait_for(warmup(candidate, item.model, item.metadata.input_example), timeout=30)
+                        _validate_output(item.metadata.output_schema, output)
+                        json.dumps(output, allow_nan=False)
+                        updated.append(replace(item, runtime_id=candidate.id, runtime_image=candidate.image))
+            except BaseException:
+                await self._stop_failed_candidate(candidate)
+                raise
+            try:
+                deleted = await self._repository.delete_model(model, updated)
+            except BaseException:
+                # An uncertain COMMIT must not destroy a possibly active candidate.
+                if candidate:
+                    self._runtime_handles[candidate.id] = candidate
+                self._reconciliation_required = True
+                raise
+            if not deleted:
+                await self._stop_failed_candidate(candidate)
+                raise ServiceError("MODEL_NOT_FOUND", "Managed model was not found", status_code=404, param="model")
+            deployments = {name: item for name, item in snapshot.deployments.items() if name != model}
+            deployments.update({item.model: item for item in updated})
+            runtimes = dict(snapshot.runtimes)
+            if candidate:
+                runtimes[candidate.id] = candidate
+                self._runtime_handles[candidate.id] = candidate
+            used = {item.runtime_id for item in deployments.values() if item.runtime_enabled}
+            runtimes = {identity: handle for identity, handle in runtimes.items() if identity in used}
+            async with self._fleet_lock:
+                self._active_snapshot = FleetSnapshot(runtimes, deployments)
+                # A previous fleet may still contain the deleted model. Prevent
+                # rollback of a neighbour from restoring it or its old routes.
+                self._previous_snapshot = None
+            if selected:
+                self._metrics.active_version.labels(model, selected.version).set(0)
+                self._metrics.runtime_status.labels(model, selected.version, "active").set(0)
+            for identity, handle in tuple(self._runtime_handles.items()):
+                if identity in runtimes:
+                    continue
+                async with self._idle:
+                    await self._idle.wait_for(lambda: self._inflight.get(identity, 0) == 0)
+                await self._runtime.stop(handle)
+                self._runtime_handles.pop(identity, None)
+                self._inflight.pop(identity, None)
 
     async def lifecycle(self, identity: str, action: str, *, model: bool = False) -> dict[str, Any]:
         """Serialize operator changes with rollouts; publish only validated candidates."""
@@ -584,7 +654,7 @@ class DeploymentManager:
                     self._previous_snapshot = None
                 retained_ids = set(self._previous_snapshot.runtimes) if self._previous_snapshot else set()
             for runtime_id, runtime in snapshot.runtimes.items():
-                if runtime_id in active_ids or runtime_id in retained_ids:
+                if runtime_id in active_ids or runtime_id in retained_ids or runtime_id not in self._runtime_handles:
                     continue
                 async with self._idle:
                     await self._idle.wait_for(lambda: self._inflight.get(runtime_id, 0) == 0)

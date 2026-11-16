@@ -14,7 +14,8 @@ export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect
     setPending(`${kind}:${id}:${action}`);
     setActionError(null);
     try {
-      await request(`/internal/v1/${kind}/${encodeURIComponent(id)}/${action}`, { method: 'POST', timeout: 600000 });
+      const deleting = action === 'delete';
+      await request(`/internal/v1/${kind}/${encodeURIComponent(id)}${deleting ? '' : `/${action}`}`, { method: deleting ? 'DELETE' : 'POST', timeout: 600000 });
       setChecks({});
     } catch (cause) { setActionError(cause.message); }
     finally {
@@ -40,7 +41,7 @@ export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect
 
   return <section className="panel runtime-panel" aria-labelledby="models-title">
     <div className="panel-heading"><div><h2 id="models-title">Контейнеры и модели</h2><p>Управление контейнерами и моделями, включая выключенные.</p></div><span className="count-badge">{runtimes === null ? '—' : countLabel(runtimes.length, 'группа', 'группы', 'групп')}</span></div>
-    {pending && <p role="status">Выполняется операция… Запуск и редеплой могут занять несколько минут.</p>}
+    {pending && <p role="status">Выполняется операция… Запуск, редеплой и удаление могут занять несколько минут.</p>}
     {actionError && <p className="field-error" role="alert">{actionError}</p>}
     {error && <div className="inline-notice notice-warning" role="alert"><Icon name="alert" /><span>Не удалось обновить контейнеры. {error} Показаны последние доступные данные.</span></div>}
     {!runtimes?.length ? <div className="empty-state"><span className="empty-icon"><Icon name="model" size={28} /></span><strong>{error ? 'Список контейнеров недоступен' : runtimes === null ? 'Получаем контейнеры…' : 'Активных контейнеров пока нет'}</strong><p>{error ? 'Повторите обновление состояния сервиса.' : 'После развёртывания здесь появятся контейнеры, состав моделей и их собственные счётчики запросов.'}</p>{error ? <button type="button" className="button button-quiet" disabled={refreshing} onClick={() => void onRefresh()}>Повторить обновление</button> : runtimes !== null && <a className="button button-quiet" href="#deploy">Перейти к развёртыванию<Icon name="arrow" size={15} /></a>}</div> : <div className="runtime-groups">{runtimes.map(runtime => {
@@ -60,7 +61,7 @@ export default function RuntimeGroups({ runtimes, error, selectedModel, onSelect
           <Metric label="Ошибки" value={number(model.requests?.failed)} />
           <Metric label="В работе" value={number(model.requests?.in_progress)} />
           <Metric label="Среднее время" value={model.requests?.average_latency_ms == null ? '—' : `${number(model.requests.average_latency_ms)} мс`} />
-          <div className="model-controls"><button type="button" className="text-button" disabled={!!pending || runtime.status === 'stopped'} onClick={() => void act('models', model.id, model.enabled === false ? 'start' : 'stop')}>{model.enabled === false ? 'Запустить' : 'Остановить'}</button><button type="button" className="text-button" disabled={!!pending} onClick={() => void act('models', model.id, 'redeploy')}>Редеплой</button><button type="button" disabled={!!pending || model.enabled === false || runtime.status === 'stopped'} className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button></div>
+          <div className="model-controls"><button type="button" className="text-button" disabled={!!pending || runtime.status === 'stopped'} onClick={() => void act('models', model.id, model.enabled === false ? 'start' : 'stop')}>{model.enabled === false ? 'Запустить' : 'Остановить'}</button><button type="button" className="text-button" disabled={!!pending} onClick={() => void act('models', model.id, 'redeploy')}>Редеплой</button><button type="button" className="text-button" disabled={!!pending} onClick={() => { if (window.confirm(`Удалить модель «${model.id}» из сервиса вместе со всей историей развёртываний? Для возврата потребуется новый деплой. Модель в MLflow сохранится.`)) void act('models', model.id, 'delete'); }}>Удалить</button><button type="button" disabled={!!pending || model.enabled === false || runtime.status === 'stopped'} className="text-button runtime-model-action" onClick={() => onSelect(model.id)} aria-label={`Запрос к модели ${model.id}`}>Запрос<Icon name="arrow" size={15} /></button></div>
         </div>)}
       </article>;
     })}</div>}
