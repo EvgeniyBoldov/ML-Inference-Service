@@ -687,7 +687,7 @@ class PredictionService:
             async with self._deployments.prediction_runtime(model) as (deployment, runtime):
                 if deployment.metadata is None:
                     raise ServiceError("RUNTIME_UNAVAILABLE", "Active model metadata is missing", status_code=503)
-                _validate_input(deployment.metadata.input_schema, payload)
+                payload = _validate_input(deployment.metadata.input_schema, payload)
                 try:
                     started_at = perf_counter()
                     output = await asyncio.wait_for(self._runtime.predict(runtime, model, payload), timeout=self._timeout)
@@ -731,12 +731,13 @@ def _validate_metadata(metadata: ModelMetadata, deployment: Deployment) -> None:
         raise ServiceError("MODEL_SIGNATURE_INVALID", "Model schema or input example is invalid", status_code=422) from exc
 
 
-def _validate_input(schema: dict[str, Any], payload: Any) -> None:
+def _validate_input(schema: dict[str, Any], payload: Any) -> Any:
     try:
         json.dumps(payload, allow_nan=False)
     except (ValueError, TypeError) as exc:
         raise ServiceError("SCHEMA_VALIDATION_ERROR", "Input must contain finite JSON values", param="input") from exc
     try:
+        payload = _coerce_to_schema(schema, payload, "input")
         validate(instance=payload, schema=schema)
     except SchemaError as exc:
         raise ServiceError("MODEL_SIGNATURE_INVALID", "Stored model input schema is invalid", status_code=502) from exc
@@ -744,6 +745,116 @@ def _validate_input(schema: dict[str, Any], payload: Any) -> None:
         path = ".".join(str(part) for part in exc.path)
         param = f"input.{path}" if path else "input"
         raise ServiceError("SCHEMA_VALIDATION_ERROR", exc.message, param=param) from exc
+    return payload
+
+
+def _coerce_to_schema(schema: dict[str, Any], value: Any, path: str) -> Any:
+    """Coerce JSON input values to the types declared by the model signature."""
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        # Prefer a type already matching the input, then try the declared alternatives.
+        for candidate in expected:
+            if _matches_json_type(value, candidate):
+                expected = candidate
+                break
+        else:
+            for candidate in expected:
+                try:
+                    return _coerce_to_schema({**schema, "type": candidate}, value, path)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            return value
+
+    try:
+        if expected == "string":
+            if value is None:
+                return "null"
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            return str(value)
+        if expected == "integer":
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int, float)):
+                if int(value) != value:
+                    return value
+                return int(value)
+            if isinstance(value, str):
+                return int(value.strip(), 10)
+        elif expected == "number":
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                return float(value.strip())
+        elif expected == "boolean":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and value in (0, 1):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes", "on"}:
+                    return True
+                if lowered in {"false", "0", "no", "off"}:
+                    return False
+        elif expected == "array":
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, list) and isinstance(schema.get("items"), dict):
+                return [_coerce_to_schema(schema["items"], item, f"{path}.{index}") for index, item in enumerate(value)]
+            if isinstance(value, list):
+                return value
+        elif expected == "object":
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                return _coerce_object(schema, value, path)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return value
+
+
+def _coerce_object(schema: dict[str, Any], value: dict[str, Any], path: str) -> dict[str, Any]:
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    for name in required:
+        if name not in value:
+            expected = _schema_type_name(properties.get(name, {}))
+            param = f"{path}.{name}" if path else str(name)
+            raise ServiceError(
+                "SCHEMA_VALIDATION_ERROR",
+                f"Required parameter '{name}' is missing (expected type: {expected})",
+                param=param,
+            )
+    result = dict(value)
+    for name, property_schema in properties.items():
+        if name in result and isinstance(property_schema, dict):
+            child_path = f"{path}.{name}" if path else str(name)
+            result[name] = _coerce_to_schema(property_schema, result[name], child_path)
+    return result
+
+
+def _schema_type_name(schema: Any) -> str:
+    expected = schema.get("type") if isinstance(schema, dict) else None
+    if isinstance(expected, list):
+        return " or ".join(str(item) for item in expected)
+    return str(expected or "unspecified")
+
+
+def _matches_json_type(value: Any, expected: str) -> bool:
+    return {
+        "null": value is None,
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "string": isinstance(value, str),
+        "array": isinstance(value, list),
+        "object": isinstance(value, dict),
+    }.get(expected, False)
 
 
 def _validate_output(schema: dict[str, Any], output: Any) -> None:
